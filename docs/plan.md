@@ -30,6 +30,38 @@ Your instinct to separate these is right, and the discipline that makes it work 
 | MVP 03 — ROI, margin | accounting layer | 5 |
 | MVP 04 — cannibalisation | transfer matrix from baskets | 6 |
 | MVP 05, 06 — ranking, recommender | shrinkage + response curves | 7 |
+| Required final output — what to stop running | pattern search + shrunk ranking | 7 |
+
+---
+
+## Where this dataset sits in the chain
+
+**This is sell-out data: retailer to end consumer.** Every row is a basket a
+shopper actually paid for, at a store, on a day. It is not sell-in — we are not
+looking at a manufacturer shipping cases to a distributor and guessing what
+happened afterwards.
+
+The participant guide warns that promotional analysis often cannot observe
+end-consumer purchases, so lift measured at the shipment level confounds
+retailer stock-building with genuine demand. **That warning does not bind here.**
+There is no channel inventory between the promotion and the observation, so a
+measured unit is a consumed unit, and there is no forward-buy artefact to strip
+out.
+
+State this as an advantage in the demo, in three parts:
+
+1. **No sell-in confound.** Lift is demand, not stock movement.
+2. **Basket-level granularity.** `BASKET_ID` is what makes Phase 6 identified at
+   all. A project reading store totals or shipment volumes can assert
+   cannibalisation but cannot measure it.
+3. **Household continuity.** The same `household_key` recurs across 102 weeks,
+   which is what makes repurchase cycles, pre-window substitute purchase, and
+   post-promotion troughs observable rather than assumed.
+
+The honest counterweight, stated in the same breath: this is one retailer's
+2,500-household panel, so the *external* generalisation is limited even though
+the *internal* observation is clean. Precision about consumption, not breadth of
+market.
 
 ---
 
@@ -265,9 +297,47 @@ This is your first demoable checkpoint. If everything after this failed, you wou
 
 ## Phase 5 — Accounting (MVP 03)
 
-> **Prompt:** Write `promo/accounting.py`. Compute the subsidy — the discount paid on all units sold during the promotion, not only the incremental ones. Compute promotional profit as incremental margin minus subsidy, parameterised on an assumed margin. Compute ROI as a bootstrap interval from the baseline's quantile draws, returning ROI_UNBOUNDED when the denominator interval spans zero. Never average ROIs across campaigns; aggregate components and divide once.
+> **Prompt:** Write `promo/accounting.py`. Compute the subsidy — the discount paid on all units sold during the promotion, not only the incremental ones. Compute promotional profit as incremental margin minus total promotional cost, parameterised on an assumed margin. Compute ROI as a bootstrap interval from the baseline's quantile draws, returning ROI_UNBOUNDED when the denominator interval spans zero. Never average ROIs across campaigns; aggregate components and divide once.
 
-**Done when:** every campaign has a break-even margin, a margin-sensitivity table, and either an ROI interval or a stated refusal.
+### Task 5.1 — Total promotional cost has two components, not one
+
+Promotional cost is **discount subsidy plus free goods**. Both are money the
+retailer gave away to run the promotion; counting only the first understates the
+denominator of every ROI in the system.
+
+> **Prompt:** In `promo/accounting.py`, compute promotional cost as two separately reported components summed into one total:
+> - **`subsidy`** — the discount paid on all units sold during the promotion, from the Phase 2.3 discount decomposition, kept split by mechanic (loyalty, manufacturer coupon, coupon match) because the cost bearer differs.
+> - **`free_goods`** — the giveaway lines: rows with `QUANTITY > 0` and `SALES_VALUE == 0`. Value them at the product's reconstructed regular price per unit from Phase 2.3, not at zero, and not at the paid price. Report the units given away, the count of rows, and the imputed value. Where no regular price is recoverable for that product, report those units as `free_goods_unpriced` and refuse to fold them into the total rather than valuing them at zero.
+>
+> Return `promo_cost_total = subsidy + free_goods`, with both components and the unpriced residual visible in the diagnostics dict. ROI, break-even margin, and the margin-sensitivity sweep all use the total, never the subsidy alone.
+
+**Why these rows are a cost and not noise.** Phase 1 found **4,451 rows with
+positive `QUANTITY` and zero `SALES_VALUE`, carrying 4,544 units**
+(`docs/data_findings.md`). They are a rounding error in units — 0.00% of the
+260.7M total — and they were *correctly* excluded from the volume-measured
+analysis, because they are a different phenomenon from the KIOSK-GAS fuel rows.
+That exclusion was about **units**. This is about **money**. A buy-one-get-one
+free arm, a sampling giveaway, or a store-funded free line costs the retailer the
+full regular price of every unit handed over, and the transaction file records it
+as revenue zero. Left out, the promotion looks cheaper than it was.
+
+Two consequences to encode:
+
+1. **Do not reuse the Phase 2.2 volume-measured exclusion here.** That filter
+   drops rows for being unit-incomparable. These rows must survive into the
+   accounting layer as a cost line even though they contribute no revenue. If
+   `clean.py` has already removed them, the accounting layer reads them back from
+   the pre-exclusion frame and says so in its diagnostics.
+2. **Free goods are a cost, never a lift.** Units given away are not incremental
+   demand. Assert that `free_goods` units never enter the Phase 4 lift numerator;
+   a test should fail if they do.
+
+Report the two components separately in the UI as well as summed. A campaign
+whose cost is 90% free goods is a structurally different instrument from one
+that is 90% price discount, and the recommendation in Phase 7 depends on telling
+them apart.
+
+**Done when:** every campaign has a break-even margin, a margin-sensitivity table, and either an ROI interval or a stated refusal — and total promotional cost is reported as subsidy plus free goods, with the split visible and the unpriced residual stated rather than silently zeroed.
 
 ---
 
@@ -283,11 +353,97 @@ You have BASKET_ID, so this is identified. Most teams working from store totals 
 
 ---
 
-## Phase 7 — Ranking and recommendation (MVP 05, 06)
+## Phase 7 — Ranking, pattern search, and recommendation (MVP 05, 06)
+
+### Task 7.1 — Ranking
 
 > **Prompt:** Write `promo/decide.py`. Rank campaigns on James-Stein shrunk estimates rather than raw ones, and publish the shrunk value as the expectation. Fit a lift-versus-depth response curve per commodity and locate where marginal return crosses zero. Add an MDE calculator over holdout fraction, cluster count, cluster size, and intra-cluster correlation.
 
-**Done when:** the ranking is shrunk, the response curves are fitted, and the MDE calculator runs — giving you a recommendation whose headline is "hold out 20% next time."
+### Task 7.2 — Cross-campaign pattern search
+
+Ranking answers *which campaign* did well. It does not answer *what kind of
+promotion* does well, and the second question is the one a merchant can act on
+next quarter. Search for structure across campaigns on four axes.
+
+> **Prompt:** Write `promo/patterns.py` with `search_patterns(campaign_results, panel)`. Partition the evaluated campaigns along four pre-declared axes and, within each segment, report the pooled effect — aggregate the components and divide once, never an average of per-campaign ratios. The axes:
+>
+> - **Discount depth** — banded from the Phase 2.3 depth, e.g. 0–10%, 10–20%, 20–30%, 30–50%, 50%+. Exclude `bounded` products from depth bands entirely, since their depth is ordinal only; report how many campaigns that removes.
+> - **Timing** — week-of-year block, holiday proximity, campaign length in weeks, and position relative to the commodity's repurchase cycle (shorter than one cycle, one to two, longer).
+> - **Product** — `DEPARTMENT`, `COMMODITY_DESC`, price tier relative to category median, and repurchase-cycle band (fast versus slow movers).
+> - **Store segment** — store traffic tier, store count carrying the product, and treatment intensity (how much of the store's assortment was on deal that week).
+>
+> Return one row per (axis, segment) with: campaign count, distinct products, distinct stores, pooled lift, pooled promotional cost, break-even margin, and the verdict from Task 7.3. Return `(DataFrame, dict)` like every other stage.
+
+**The declaration rule.** The axis and band definitions are written down *before*
+the effects are looked at, and the file records the full list of segments tested,
+including the ones that came back null. A pattern search whose denominator of
+attempted tests is unrecorded is not a search, it is a story. The count of tests
+performed is what Task 7.3 needs.
+
+### Task 7.3 — The coincidence test
+
+With few campaigns per segment, the strongest-looking pattern is exactly what you
+would expect from noise plus a wide search. Every claimed pattern must clear four
+hurdles, all reported, before it can be called a pattern.
+
+> **Prompt:** Add `test_pattern(segment, campaign_results, seed)` to `promo/patterns.py` returning a `PatternVerdict` pydantic model (axis, segment, n_campaigns, effect, hurdles dict, status, reason_code, message). The four hurdles:
+>
+> 1. **Effective sample size.** `n` is the number of **independent campaigns** in the segment, not product-store-weeks. Product-store-weeks within one campaign are one draw, not thousands. If `n_campaigns < 5`, return status `INSUFFICIENT` with reason code `FEW_CAMPAIGNS` and stop — no p-value is computed, because computing one would give it a credibility the sample cannot support.
+> 2. **Leave-one-campaign-out stability.** Recompute the segment effect dropping each campaign in turn. Report the min, max, and sign consistency across the `n` refits. A pattern that reverses sign or loses its ranking when any single campaign is removed is one campaign, not a pattern. Fail the hurdle if the sign is not consistent across all leave-one-out refits.
+> 3. **Search-corrected permutation null.** Permute the segment labels across campaigns `B >= 2000` times with an explicit `seed` and `np.random.default_rng`. On each draw, recompute the effect for **every** segment on that axis and record the *maximum* absolute effect across segments. Compare the observed effect against that max-statistic null. This corrects for having searched many segments and reporting the winner; an uncorrected per-segment p-value is not acceptable here. Report the corrected p and the number of segments the correction covers.
+> 4. **Temporal hold-out.** Refit the pattern on campaigns in the first half of the window and check whether it holds, with the same sign, on campaigns in the second half. Report both halves' effects and their campaign counts. If either half has fewer than three campaigns, report `HOLDOUT_UNAVAILABLE` rather than a pass.
+>
+> Status is `HOLDS` only when hurdles 2, 3, and 4 all pass and hurdle 1 is satisfied. `SUGGESTIVE` when the permutation survives but stability or hold-out does not. `COINCIDENCE` when the permutation does not survive. `INSUFFICIENT` when there are too few campaigns to ask. Add reason codes `FEW_CAMPAIGNS`, `UNSTABLE_TO_LEAVE_ONE_OUT`, `FAILS_PERMUTATION`, `HOLDOUT_UNAVAILABLE` to `promo/gates.py` and give each a deterministic message template.
+
+> **Prompt:** Write `tests/test_pattern_coincidence.py`. Generate campaign result sets under a null where segment membership is assigned at random and no true segment effect exists, and assert that across many seeds the `HOLDS` rate is at or below the nominal level — that is, the search does not manufacture patterns from noise. Then generate a set with one real, planted segment effect and assert it is recovered as `HOLDS` at a reasonable effect size. Also assert that a segment carrying a single dominant campaign is caught by hurdle 2 rather than reported as a pattern.
+
+The synthetic-null test is the point of this task. The search is the thing most
+likely to produce a confident wrong answer on stage, so it gets a harness that
+proves its false-positive rate, in the same way the placebo band proves the
+estimator's zero.
+
+Every pattern shown in the UI displays its `n_campaigns`, its leave-one-out
+range, and its corrected p. A pattern with `SUGGESTIVE` or `INSUFFICIENT` status
+is shown with that label, not hidden and not promoted.
+
+### Task 7.4 — The required final output: what to stop running
+
+The deliverable is not complete without a named recommendation to **stop**. A
+system that only ever ranks winners has not been asked to take a risk.
+
+> **Prompt:** Add `recommend_stop(campaign_results, patterns)` to `promo/decide.py`, returning at least one named promotion or promotion type to discontinue, together with the evidence chain that supports it. Each recommendation returns: the target (a specific campaign, or a segment from Task 7.2 named in plain language such as "30%+ depth on fast-moving GROCERY in high-traffic stores"); the shrunk lift estimate with its interval; the placebo band it was compared against; the total promotional cost including free goods; the break-even margin; the margin range over which it loses money; the cannibalisation split from Phase 6; the `PatternVerdict` if the target is a type rather than a single campaign; and the gate verdicts that let it be evaluated at all.
+
+**The bar for naming something.** A stop recommendation is supported when at
+least one of these holds, and the output states which:
+
+- The shrunk lift interval **overlaps or sits inside the placebo band** — the
+  promotion is not distinguishable from doing nothing, while the subsidy and free
+  goods are certain.
+- The break-even margin **exceeds the plausible margin range** for that
+  department, so the campaign cannot have paid under any assumption in the
+  sensitivity table. Name the range and its source as an assumption, since this
+  dataset has no COGS.
+- `delta_q` is **dominated by redistribution rather than expansion** — the
+  promotion moved sales between products at full subsidy cost without growing the
+  category.
+- The response curve from Task 7.1 shows the depth run is **past the point where
+  marginal return crosses zero**, in which case the recommendation is to reduce
+  depth to the crossing point rather than to stop entirely, and it says so.
+
+**The bar for refusing to name one.** If no campaign or type clears any of the
+above, the honest output is a refusal with a reason code, plus the closest
+candidate and the specific evidence that is missing — not silence, and not a
+recommendation stretched to fill the slot. That refusal is a legitimate final
+answer under this project's thesis, but it must be reached, not defaulted to. In
+practice on this dataset, expect at least one deep-discount segment to fail the
+placebo comparison.
+
+Never justify a stop recommendation by intuition, by category priors, or by "this
+kind of promotion usually underperforms." Every clause in the output traces to a
+computed value, and `promo/narrate.py` receives it as JSON and turns it into
+sentences without adding a number.
+
+**Done when:** the ranking is shrunk, the response curves are fitted, the MDE calculator runs, `search_patterns()` returns verdicts across all four axes with the coincidence harness passing its synthetic-null test, and `recommend_stop()` names at least one promotion or promotion type to stop with its full evidence chain — or refuses with a reason code and the missing evidence stated.
 
 ---
 
@@ -301,7 +457,7 @@ Only now. Building this earlier is the most common way hackathon projects fail.
 
 ### Task 8.2 — UI
 
-> **Prompt:** Write `app/app.py` in Streamlit with four pages reading only from data/out: Audit (the gate verdicts and data-honesty report — this is the landing page), Portfolio (ranked measurable campaigns, with unmeasurable ones listed separately by reason code), Campaign (counterfactual chart with band, placebo distribution with the estimate marked, expansion versus redistribution, subsidy bar, break-even table), and Planner (depth response curve and MDE holdout designer). Render GateResult through one shared component so refusals look like a deliberate product state everywhere.
+> **Prompt:** Write `app/app.py` in Streamlit with five pages reading only from data/out: Audit (the gate verdicts and data-honesty report — this is the landing page), Portfolio (ranked measurable campaigns, with unmeasurable ones listed separately by reason code), Campaign (counterfactual chart with band, placebo distribution with the estimate marked, expansion versus redistribution, a promotional-cost bar split into subsidy and free goods, break-even table), Patterns (the Task 7.2 segment table across all four axes, each row showing its `PatternVerdict` status, `n_campaigns`, leave-one-out range, and corrected p — `SUGGESTIVE` and `INSUFFICIENT` rows visible and labelled, never filtered out), and Planner (depth response curve, MDE holdout designer, and the Task 7.4 stop recommendation rendered as a named target with its full evidence chain). Render GateResult and PatternVerdict through one shared component so refusals look like a deliberate product state everywhere.
 
 ### Task 8.3 — Narration
 
@@ -319,13 +475,22 @@ If you fall behind, remove in this order and no other:
 2. The chat panel, keeping only pre-generated verdict paragraphs
 3. The transfer matrix, reporting gains and losses without cell-level flows
 4. Confidence intervals on the recommender, keeping them on the estimates
+5. The pattern search's store-segment and timing axes, keeping depth and product — but never the coincidence test on the axes that remain
 
-Never cut: the placebo harness, the refusal engine, the rollout, or the data-honesty report. Those four are the argument. Everything else is decoration on it.
+Never cut: the placebo harness, the refusal engine, the rollout, the data-honesty report, or the stop recommendation of Task 7.4. Those five are the argument. Everything else is decoration on it.
+
+If time collapses hard, Task 7.4 can name a single campaign rather than a type, since a single campaign needs only the placebo and break-even evidence and not the pattern search. It cannot be cut to nothing.
 
 ---
 
 ## Demo order
 
-Audit page and the refusal → the data-honesty finding about volume-measured units → an accepted campaign's counterfactual → the placebo band with the estimate outside it → expansion versus redistribution → break-even margin table → the holdout designer as the closing recommendation.
+Audit page and the refusal → the data-honesty finding about volume-measured units → an accepted campaign's counterfactual → the placebo band with the estimate outside it → expansion versus redistribution → break-even margin table with subsidy and free goods split → the pattern that survived the coincidence test → **the promotion we are telling you to stop, and the four numbers that say so** → the holdout designer.
 
-Four minutes, all six MVPs, in order.
+Four minutes, all six MVPs, in order. The stop recommendation is the close, not
+the holdout designer — a named thing to kill lands harder than a methodological
+suggestion, and it is the one slide where the placebo band, the free-goods cost,
+and the redistribution split all pay off at once. Open the sell-out point early,
+when the counterfactual first appears: what we measure is what a person carried
+out of the shop, so there is no shipment inventory hiding between the promotion
+and the number.
