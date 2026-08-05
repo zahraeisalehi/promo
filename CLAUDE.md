@@ -33,6 +33,26 @@ Do not re-litigate these; they were decided in Phase 1 and are recorded in `docs
 - Use `data/interim/transactions_sample.parquet` (300k rows) for distribution and profiling questions.
 - Always `SET memory_limit='2GB'` and `threads=2` on the DuckDB connection.
 
+## Compute budget
+
+This machine has 7.5GB of RAM. The full product-store-week panel is 92,339 × 582 × 102 ≈ **5.5 billion cells** and is infeasible. Never construct it.
+
+Phase 2 builds a **scoped panel** instead:
+
+- the top N products by purchase frequency, default **N=300**, configurable;
+- selected from the **22,153 ever-treated products only** — an untreated-only product cannot contribute to estimating a treatment effect, so it consumes the row budget and returns nothing;
+- restricted to the **115 stores present in `causal_data`** and the **93 weeks it covers**;
+- explicit zero rows only inside that scope.
+
+Record what the scope buys and what it costs: its coverage as a share of total transactions and of total sales value. A scope whose coverage is not recorded is indistinguishable from a silent filter.
+
+Hard rules:
+
+- **Never load `causal_data.csv` into pandas.** It is 36.8M rows. Aggregate it in DuckDB and join only the scoped keys.
+- Store every numeric feature column as **float32**, never float64.
+- LightGBM runs with **`max_bin=63`** and **`num_leaves` no greater than 63**.
+- Any step that would materialise more than **5 million rows** is aggregated in SQL first.
+
 ## Non-negotiable invariants
 
 - Train the baseline on `treated == 0` rows only. Raise if treated rows reach the fit — never filter silently, because that hides a caller bug.
