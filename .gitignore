@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+scratch/
+data/interim/
+data/out/
+data/raw/*.csv
+.claude/settings.local.json
+.env
