@@ -357,6 +357,80 @@ def test_price_index_is_present_on_zero_filled_rows(simple) -> None:
     assert out.loc[out["zero_filled"], "price_index"].notna().all()
 
 
+def test_no_feature_uses_data_from_a_later_week(tmp_path: Path) -> None:
+    """The general leakage certificate.
+
+    Build the panel, rebuild it with everything after week W changed, and
+    require that *no column at all* differs at weeks <= W. This replaces
+    "structurally they cannot" with a test, and because it compares every
+    column rather than a named list, it also covers any feature added later.
+
+    Both the panel's units and the transaction log are perturbed, so features
+    sourced from either — `category_units_ex_focal` and `n_stores_carrying`
+    from the panel, `store_traffic` from the transactions — are exercised.
+    `n_rows` is deliberately left alone: the scope is chosen by transaction
+    count, and changing it would select a different panel and compare two
+    different things.
+    """
+    cutoff = 6
+    weeks = range(1, 13)
+    rows = [
+        {"PRODUCT_ID": p, "STORE_ID": s, "WEEK_NO": w, "units": 5,
+         "sales_value": 5.0, "regular_price": 2.0, "on_display": True}
+        for p in (1, 2) for s in (1, 2) for w in weeks
+    ]
+    baskets = [(s, w, 1000 + 10 * w + s, True) for s in (1, 2) for w in weeks]
+
+    def build(perturbed: bool):
+        panel = _treated_panel(
+            [
+                {**r, "units": r["units"] * 10, "sales_value": r["sales_value"] * 10}
+                if perturbed and r["WEEK_NO"] > cutoff
+                else r
+                for r in rows
+            ]
+        )
+        extra = (
+            [(s, w, 9000 + 10 * w + s, True) for s in (1, 2) for w in weeks
+             if w > cutoff]
+            if perturbed
+            else []
+        )
+        # The two runs need separate transaction files; everything else is
+        # identical between them by construction.
+        where = tmp_path / "p" if perturbed else tmp_path
+        fix = {
+            "panel": panel,
+            "causal": _causal(tmp_path, [(1, 1, 1, "9", "A")]),
+            "product": _product(tmp_path, [(1, "SOUP"), (2, "SOUP")]),
+            "transactions": _transactions(where, baskets + extra),
+        }
+        out, _ = _build(fix)
+        return out.sort_values(["PRODUCT_ID", "STORE_ID", "WEEK_NO"]).reset_index(
+            drop=True
+        )
+
+    (tmp_path / "p").mkdir(exist_ok=True)
+    base = build(perturbed=False)
+    perturbed = build(perturbed=True)
+
+    # The perturbation must actually have done something, or the test passes
+    # vacuously.
+    late = base["WEEK_NO"] > cutoff
+    assert not base.loc[late, "units"].equals(perturbed.loc[late, "units"])
+
+    early_base = base[base["WEEK_NO"] <= cutoff].reset_index(drop=True)
+    early_perturbed = perturbed[perturbed["WEEK_NO"] <= cutoff].reset_index(drop=True)
+    assert len(early_base) == len(early_perturbed) > 0
+
+    # Every declared feature must be among the columns being compared, so the
+    # certificate cannot be quietly narrowed.
+    compared = set(early_base.columns)
+    assert set(LAGGED_FEATURES) | set(CONTEMPORANEOUS_FEATURES) <= compared
+
+    pd.testing.assert_frame_equal(early_base, early_perturbed)
+
+
 def test_every_declared_feature_column_exists(simple) -> None:
     out, diag = _build(simple)
     for column in (*LAGGED_FEATURES, *CONTEMPORANEOUS_FEATURES):

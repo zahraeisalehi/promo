@@ -250,6 +250,64 @@ def test_report_collects_exclusions_from_stage_diagnostics(tmp_path: Path) -> No
     assert report["exclusions"][1]["stage"] == "prices"
 
 
+def test_partial_diagnostics_skip_entries_rather_than_crash(tmp_path: Path) -> None:
+    """A stage may write a partial file. The report degrades, it does not fail."""
+    (tmp_path / "prices_diagnostics.json").write_text(json.dumps({
+        "exclusions": [{
+            "name": "retail_disc_surcharge", "action": "exclude",
+            "effect": {"rows": 6}, "before": {"rows": 90}, "after": {"rows": 84},
+        }]
+        # no price_undefined, no panel, no totals_after
+    }))
+    report, diag = build_quality_report(tmp_path, out_path=tmp_path / "quality.json")
+    names = [e["name"] for e in report["exclusions"]]
+    assert names == ["retail_disc_surcharge"]
+    assert diag["exclusions_recorded"] == 1
+
+
+def test_scope_and_carried_pairs_and_undefined_are_recorded(tmp_path: Path) -> None:
+    """The three filters that were previously outside the exclusions list."""
+    (tmp_path / "prices_diagnostics.json").write_text(json.dumps({
+        "exclusions": [],
+        "price_undefined": {
+            "rows": 613, "rows_share": 0.000261, "units": 711, "sales_value": 0.0,
+        },
+        "panel": {"rows": 1000},
+        "totals_after": {"rows": 2000, "units": 8000, "sales_value": 400.0},
+    }))
+    (tmp_path / "feature_diagnostics.json").write_text(json.dumps({
+        "scope": {
+            "rule": "top N products",
+            "coverage": {
+                "observed_rows": 250, "transactions_share": 0.25,
+                "sales_value_share": 0.25, "units_share": 0.25,
+            },
+        },
+        "grid": {"rows": 900, "full_cross_product_rows": 1200},
+    }))
+    report, diag = build_quality_report(tmp_path, out_path=tmp_path / "quality.json")
+    by_name = {e["name"]: e for e in report["exclusions"]}
+    assert diag["exclusions_recorded"] == 3
+
+    undefined = by_name["price_undefined"]
+    assert undefined["action"] == "flag"          # rows survive, prices do not
+    assert undefined["effect"]["rows"] == 613
+    assert undefined["before"] == undefined["after"]
+
+    scope = by_name["scope_restriction"]
+    assert scope["action"] == "exclude"
+    assert scope["effect"]["rows"] == 1000 - 250
+    assert scope["effect"]["units"] == 6000       # 75% of 8000 dropped
+    assert scope["effect"]["sales_value"] == 300.0
+    assert scope["share_of_all"]["sales_value_share"] == pytest.approx(0.75)
+
+    pairs = by_name["carried_pairs_only"]
+    assert pairs["action"] == "not_created"
+    assert pairs["effect"]["rows"] == 300         # 1200 - 900, never materialised
+    assert pairs["effect"]["units"] == 0
+    assert set(report["actions"]) == {"exclude", "flag", "not_created"}
+
+
 def test_report_is_written_as_json(tmp_path: Path) -> None:
     out = tmp_path / "quality.json"
     _, diag = build_quality_report(tmp_path, out_path=out)

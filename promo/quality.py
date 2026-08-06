@@ -515,10 +515,18 @@ def build_quality_report(
                 "after": entry.get("after"),
             }
         )
+    exclusions.extend(_late_exclusions(loaded))
 
     report: dict[str, Any] = {
         "report": "Phase 2 data honesty",
         "sources": sources,
+        "actions": {
+            "exclude": "rows removed from what flows downstream",
+            "flag": "rows retained, marked, and still usable",
+            "not_created": (
+                "rows that were never materialised; there was nothing to remove"
+            ),
+        },
         "exclusions": exclusions,
         "scope": _scope_section(loaded),
         "no_margin": _margin_section(loaded),
@@ -543,21 +551,134 @@ def build_quality_report(
     return report, diagnostics
 
 
+def _late_exclusions(loaded: dict[str, Any]) -> list[dict[str, Any]]:
+    """The three filters that were recorded elsewhere but not as exclusions.
+
+    The scope is the largest filter in the whole pipeline — it drops about four
+    fifths of transactions — and it was previously visible only under its own
+    `scope` key. A reader auditing `exclusions` would not have seen it, which is
+    the no-silent-filters rule failing on the biggest filter there is.
+
+    Every number here is read from a diagnostics file that already computed it.
+    Nothing is recomputed and no panel is touched.
+    """
+    entries: list[dict[str, Any]] = []
+    prices = loaded.get("prices") or {}
+    features = loaded.get("features") or {}
+
+    # A stage may have written a partial diagnostics file. Skipping an entry
+    # whose inputs are absent is right; crashing the honesty report because one
+    # key is missing is not.
+    undefined = prices.get("price_undefined")
+    panel_rows = (prices.get("panel") or {}).get("rows")
+
+    if undefined and panel_rows:
+        entries.append(
+            {
+                "stage": "prices",
+                "name": "price_undefined",
+                # Rows survive; their prices do not. Not an "exclude", but it
+                # removes them from every price-based analysis downstream.
+                "action": "flag",
+                "definition": "units <= 0 or a zero reconstruction base",
+                "effect": {
+                    "rows": undefined["rows"],
+                    "units": undefined["units"],
+                    "sales_value": undefined["sales_value"],
+                },
+                "share_of_all": {"rows_share": undefined["rows_share"]},
+                "before": {"rows": panel_rows},
+                "after": {"rows": panel_rows},
+                "note": (
+                    "Retained with null prices rather than dropped. Excluded "
+                    "from price-based analysis, not from the panel."
+                ),
+            }
+        )
+
+    coverage = (features.get("scope") or {}).get("coverage")
+    grid = features.get("grid")
+    totals = prices.get("totals_after")
+
+    if coverage and grid and totals and panel_rows:
+        kept_rows = coverage["observed_rows"]
+
+        def _dropped(share_key: str, total_key: str) -> float:
+            kept = coverage[share_key] * totals[total_key]
+            return round(totals[total_key] - kept, 2)
+
+        entries.append(
+            {
+                "stage": "features",
+                "name": "scope_restriction",
+                "action": "exclude",
+                "definition": features["scope"]["rule"],
+                "effect": {
+                    "rows": panel_rows - kept_rows,
+                    "units": int(_dropped("units_share", "units")),
+                    "sales_value": _dropped("sales_value_share", "sales_value"),
+                },
+                "share_of_all": {
+                    "rows_share": round(1 - kept_rows / panel_rows, 6),
+                    "transactions_share": round(
+                        1 - coverage["transactions_share"], 6
+                    ),
+                    "units_share": round(1 - coverage["units_share"], 6),
+                    "sales_value_share": round(
+                        1 - coverage["sales_value_share"], 6
+                    ),
+                },
+                "before": {"rows": panel_rows},
+                "after": {"rows": kept_rows},
+                "note": (
+                    "The largest filter in the pipeline. What it keeps is in "
+                    "the `scope` section; what it drops is here, so the two "
+                    "readings cannot diverge."
+                ),
+            }
+        )
+        entries.append(
+            {
+                "stage": "features",
+                "name": "carried_pairs_only",
+                # These rows were never created, so there is nothing to remove.
+                "action": "not_created",
+                "definition": (
+                    "zero rows are filled only for product-store pairs observed "
+                    "at least once inside the scope"
+                ),
+                "effect": {
+                    "rows": grid["full_cross_product_rows"] - grid["rows"],
+                    "units": 0,
+                    "sales_value": 0.0,
+                },
+                "before": {"rows": grid["full_cross_product_rows"]},
+                "after": {"rows": grid["rows"]},
+                "note": (
+                    "A pair never observed is a shelf the store does not stock. "
+                    "Creating those rows would invent demand observations, so "
+                    "they carry no units and no sales by construction."
+                ),
+            }
+        )
+    return entries
+
+
 def _scope_section(loaded: dict[str, Any]) -> dict[str, Any] | None:
     features = loaded.get("features")
     if not features:
         return None
-    scope = features["scope"]
-    grid = features["grid"]
+    scope = features.get("scope") or {}
+    grid = features.get("grid") or {}
     return {
-        "rule": scope["rule"],
-        "products": scope["n_products"],
-        "stores": scope["n_stores"],
-        "weeks": scope["n_weeks"],
-        "panel_rows": grid["rows"],
-        "observed_rows": grid["observed_rows"],
-        "zero_filled_share": grid["zero_filled_share"],
-        "buys": scope["coverage"],
+        "rule": scope.get("rule"),
+        "products": scope.get("n_products"),
+        "stores": scope.get("n_stores"),
+        "weeks": scope.get("n_weeks"),
+        "panel_rows": grid.get("rows"),
+        "observed_rows": grid.get("observed_rows"),
+        "zero_filled_share": grid.get("zero_filled_share"),
+        "buys": scope.get("coverage"),
         "costs": (
             "Everything outside the scope is not measured. The coverage shares "
             "above are what the row budget bought; a scope whose coverage is "
@@ -571,10 +692,10 @@ def _margin_section(loaded: dict[str, Any]) -> dict[str, Any] | None:
     if not ingest:
         return None
     return {
-        "has_margin": ingest["has_margin"],
-        "has_cogs": ingest["has_cogs"],
-        "reason_code": ingest["margin_reason_code"],
-        "note": ingest["margin_note"],
+        "has_margin": ingest.get("has_margin"),
+        "has_cogs": ingest.get("has_cogs"),
+        "reason_code": ingest.get("margin_reason_code"),
+        "note": ingest.get("margin_note"),
     }
 
 
@@ -583,10 +704,10 @@ def _treatment_section(loaded: dict[str, Any]) -> dict[str, Any] | None:
     if not treatment:
         return None
     return {
-        "definition": treatment["definition"]["treated"],
-        "duplicate_rule": treatment["duplicate_rule"]["rule"],
-        "treated_rows": treatment["treated"]["rows"],
-        "absence_assumption": treatment["absence_assumption"],
+        "definition": (treatment.get("definition") or {}).get("treated"),
+        "duplicate_rule": (treatment.get("duplicate_rule") or {}).get("rule"),
+        "treated_rows": (treatment.get("treated") or {}).get("rows"),
+        "absence_assumption": treatment.get("absence_assumption"),
     }
 
 
