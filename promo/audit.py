@@ -60,10 +60,13 @@ __all__ = [
     "AXES",
     "DEFAULT_COVARIATES",
     "LEAKAGE_AUC",
+    "MAX_COLLISION_SHARE",
     "MEANINGFUL_MIXED_SHARE",
     "PROPENSITY_HIGH",
     "PROPENSITY_LOW",
     "UnobservedRowsError",
+    "collisions",
+    "horizon_check",
     "overlap",
     "variation_axes",
     "write_diagnostics",
@@ -99,6 +102,14 @@ PROPENSITY_HIGH: float = 0.98
 #: Above this cross-validated AUC, treated and untreated are so separable that
 #: leakage is the first explanation to rule out, not the last.
 LEAKAGE_AUC: float = 0.95
+
+#: Share of treated rows (or of controls) that may carry a second promotional
+#: mechanic before the estimand stops being a single-treatment effect. Not a
+#: recorded decision — the plan asks for the check, not a bar — so it is a
+#: parameter with a stated default. Below a twentieth, contamination moves the
+#: estimate by a few percent even if the second mechanic were as strong as the
+#: first; above it, the label on the estimate is wrong.
+MAX_COLLISION_SHARE: float = 0.05
 
 
 class UnobservedRowsError(Exception):
@@ -673,6 +684,266 @@ def _diagnose_overlap(
             "a near-perfect AUC that says nothing about confounding."
         ),
     }
+
+
+def collisions(
+    panel: str | Path | pd.DataFrame = "data/interim/panel.parquet",
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    treatment_column: str = "treated",
+    secondary_column: str = "in_mailer",
+    max_collision_share: float = MAX_COLLISION_SHARE,
+    require_observed: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Where a second promotional mechanic fires alongside the treatment.
+
+    Settled decision 4 makes `display` the treatment and keeps `mailer` as a
+    covariate. That is a statement about identification, not about the world:
+    the mailer still ran. Two consequences follow and this check measures both,
+    because they break the estimate in different directions.
+
+    **Treated rows carrying a mailer.** For those rows the measured effect is
+    display *and* mailer jointly. Calling it a display effect overstates what
+    display alone does, by however much the mailer contributed.
+
+    **Untreated rows carrying a mailer.** These are worse and easier to miss.
+    They sit in the control group and in the Phase 4 baseline's training set,
+    yet they were promoted. A contaminated control has its units lifted, so the
+    counterfactual is fitted too high and the estimated lift is biased
+    *towards zero*.
+
+    The second is the reason this check reports all four cells rather than the
+    single collision count the plan asks for: a clean treated group against a
+    promoted control group is not a clean comparison.
+
+    Returns:
+        `(cells, diagnostics)`. `cells` has one row per (treated, secondary)
+        combination with rows, units and their shares.
+
+    Raises:
+        UnobservedRowsError: as in `variation_axes`.
+        KeyError: either column is missing from the panel.
+    """
+    own = con is None
+    con = connect() if con is None else con
+    try:
+        # `units` rides along as a requested column rather than a covariate:
+        # this check fits nothing, it counts.
+        frame = _load_for_overlap(
+            panel, con, treatment_column, [secondary_column, "units"],
+            require_observed,
+        )
+    finally:
+        if own:
+            con.close()
+
+    frame["_secondary"] = frame[secondary_column].astype(bool)
+    treated, secondary = frame["_treated"], frame["_secondary"]
+    total_rows, total_units = len(frame), float(frame["units"].sum())
+
+    cells = []
+    for is_treated, is_secondary, label in (
+        (True, True, "treated_with_secondary"),
+        (True, False, "treated_clean"),
+        (False, True, "control_with_secondary"),
+        (False, False, "control_clean"),
+    ):
+        mask = (treated == is_treated) & (secondary == is_secondary)
+        cells.append(
+            {
+                "cell": label,
+                "treated": is_treated,
+                "secondary": is_secondary,
+                "rows": int(mask.sum()),
+                "rows_share": round(float(mask.mean()), 6),
+                "units": int(frame.loc[mask, "units"].sum()),
+                "units_share": round(
+                    float(frame.loc[mask, "units"].sum()) / total_units, 6
+                )
+                if total_units
+                else 0.0,
+            }
+        )
+    cells = pd.DataFrame(cells)
+
+    n_treated = int(treated.sum())
+    n_control = total_rows - n_treated
+    collision = int((treated & secondary).sum())
+    contaminated = int((~treated & secondary).sum())
+    collision_share = collision / n_treated if n_treated else 0.0
+    contaminated_share = contaminated / n_control if n_control else 0.0
+
+    diagnostics = {
+        "stage": "collisions",
+        "treatment_column": treatment_column,
+        "secondary_column": secondary_column,
+        "rows": total_rows,
+        "treated_rows": n_treated,
+        "control_rows": n_control,
+        "collision": {
+            "rows": collision,
+            "share_of_treated": round(collision_share, 6),
+            "units": int(frame.loc[treated & secondary, "units"].sum()),
+            "meaning": (
+                f"On these rows the estimand is the joint effect of "
+                f"{treatment_column} and {secondary_column}, not of "
+                f"{treatment_column} alone."
+            ),
+        },
+        "contaminated_controls": {
+            "rows": contaminated,
+            "share_of_controls": round(contaminated_share, 6),
+            "units": int(frame.loc[~treated & secondary, "units"].sum()),
+            "meaning": (
+                f"These rows are untreated by the {treatment_column} definition "
+                f"but were promoted through {secondary_column}. They enter the "
+                f"Phase 4 baseline as controls, lifting the counterfactual and "
+                f"biasing the measured effect towards zero."
+            ),
+        },
+        "threshold": max_collision_share,
+        "status": (
+            "OVERLAPPING_TREATMENTS"
+            if max(collision_share, contaminated_share) > max_collision_share
+            else "SEPARABLE"
+        ),
+        "reading": (
+            "Both figures matter and they push opposite ways. Collisions "
+            "inflate the effect by crediting display with the mailer's work; "
+            "contaminated controls deflate it by raising the baseline. They do "
+            "not cancel, because they act on different rows."
+        ),
+        "remedies": [
+            (
+                f"Restrict to rows where {secondary_column} is false, which "
+                f"estimates a clean {treatment_column} effect on a smaller "
+                f"panel."
+            ),
+            (
+                f"Keep {secondary_column} as a covariate so the model can "
+                f"separate them, which is what settled decision 4 assumes and "
+                f"what the Phase 2.6 feature set does not currently include."
+            ),
+            "Report the joint effect and label it as joint.",
+        ],
+    }
+    return cells, diagnostics
+
+
+def horizon_check(
+    campaigns: pd.DataFrame,
+    cycles: str | Path | pd.DataFrame = "data/interim/repurchase_cycles.parquet",
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    commodity_column: str = "COMMODITY_DESC",
+    horizon_column: str = "horizon_weeks",
+    required_column: str = "horizon_weeks",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Is each campaign's measurement window long enough for its commodity?
+
+    A window that closes before the category's repurchase cycle has run banks
+    the promotional peak and never sees the trough that follows it. Task 1.5
+    fixed the rule: the measurement window extends past campaign end by at
+    least the commodity's cycle.
+
+    Campaigns are **supplied**, not derived. Phase 3's job is to give a verdict
+    on a proposed campaign, so what constitutes one belongs to the caller; this
+    check takes whatever it is given and compares it against the cycles Task 2.7
+    recorded.
+
+    Args:
+        campaigns: one row per campaign, carrying `commodity_column` and
+            `horizon_column` — the number of weeks the window stays open
+            **after campaign end**.
+        cycles: the Task 2.7 repurchase-cycle table.
+        commodity_column: the campaign column naming the commodity.
+        horizon_column: the campaign column holding the proposed horizon.
+        required_column: the cycles column holding the required weeks.
+
+    Returns:
+        `(checked, diagnostics)`. `checked` is `campaigns` with `required_weeks`,
+        `shortfall_weeks`, `low_support` and `status` added.
+
+    Raises:
+        KeyError: a required column is missing from either frame.
+    """
+    for column in (commodity_column, horizon_column):
+        if column not in campaigns.columns:
+            raise KeyError(f"{column!r} is not a column of campaigns")
+
+    own = con is None
+    con = connect() if con is None else con
+    try:
+        if isinstance(cycles, pd.DataFrame):
+            table = cycles
+        else:
+            table = con.execute(
+                f"SELECT * FROM read_parquet('{Path(cycles).as_posix()}')"
+            ).df()
+    finally:
+        if own:
+            con.close()
+
+    for column in (commodity_column, required_column):
+        if column not in table.columns:
+            raise KeyError(f"{column!r} is not a column of the cycles table")
+
+    keep = [commodity_column, required_column]
+    if "low_support" in table.columns:
+        keep.append("low_support")
+    lookup = table[keep].rename(columns={required_column: "required_weeks"})
+
+    checked = campaigns.merge(
+        lookup, on=commodity_column, how="left", validate="many_to_one"
+    )
+    if "low_support" not in checked.columns:
+        checked["low_support"] = False
+    checked["low_support"] = checked["low_support"].fillna(False).astype(bool)
+
+    required = pd.to_numeric(checked["required_weeks"], errors="coerce")
+    proposed = pd.to_numeric(checked[horizon_column], errors="coerce")
+    checked["shortfall_weeks"] = (required - proposed).where(required > proposed)
+
+    # A commodity with no recorded cycle cannot be checked. That is not a pass:
+    # an unknown requirement is reported as unknown so it cannot be read as
+    # "long enough".
+    status = pd.Series("OK", index=checked.index, dtype="string")
+    status = status.mask(required > proposed, "HORIZON_TOO_SHORT")
+    status = status.mask(required.isna() | proposed.isna(), "UNKNOWN_CYCLE")
+    checked["status"] = status.astype("string")
+
+    counts = checked["status"].value_counts()
+    too_short = checked[checked["status"] == "HORIZON_TOO_SHORT"]
+    diagnostics = {
+        "stage": "horizon_check",
+        "campaigns": len(checked),
+        "status_counts": {str(k): int(v) for k, v in counts.items()},
+        "too_short": len(too_short),
+        "unknown_cycle": int((checked["status"] == "UNKNOWN_CYCLE").sum()),
+        "on_a_low_support_cycle": int(
+            (checked["low_support"] & (checked["status"] != "UNKNOWN_CYCLE")).sum()
+        ),
+        "max_shortfall_weeks": (
+            int(too_short["shortfall_weeks"].max()) if len(too_short) else 0
+        ),
+        "rule": (
+            "The measurement window must extend past campaign end by at least "
+            "the commodity's repurchase cycle, or the estimate banks the peak "
+            "and never sees the trough."
+        ),
+        "floors_not_estimates": (
+            "Task 2.7 established every recorded cycle is a floor: pairs buying "
+            "in exactly one week contribute no gap and are the slowest buyers, "
+            "and gaps are right-censored by the 102-week window. Clearing the "
+            "requirement is therefore necessary and not sufficient."
+        ),
+        "unknown_is_not_a_pass": (
+            "A commodity with no recorded cycle returns UNKNOWN_CYCLE, never "
+            "OK. low_support cycles are checked but flagged: a median over a "
+            "handful of gaps is a weak requirement, not a safe one."
+        ),
+    }
+    return checked, diagnostics
 
 
 def write_diagnostics(diagnostics: dict[str, Any], path: str | Path) -> Path:

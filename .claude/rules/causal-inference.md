@@ -14,7 +14,9 @@ These files implement the estimand. Correctness here is not negotiable against c
 ## Training the counterfactual
 
 - Fit only on rows where `treated == 0`. If a caller passes a frame containing treated rows, raise — do not filter silently, because a silent filter hides a caller bug.
-- Features may not include anything derived from the promotion: no discount depth, no promo flag, no post-treatment aggregates.
+- Features may not include anything derived from **the treatment under measurement**: no display flag, no display depth, no post-treatment aggregates. The purpose is to stop the counterfactual being told about the thing being measured.
+- A **concurrent, independently-assigned mechanic** may be included as a covariate when it is known before the treatment is assigned and is not derived from it. Conditioning on it prevents omitted-variable bias rather than causing leakage. The admitted case is **`in_mailer`** — settled decision 8 in `docs/data_findings.md`. Leaving it out lets the baseline train on promoted control rows and biases every display effect toward zero.
+- Still excluded, without exception: `depth`, `on_deal`, and the discount columns.
 - Predict `log1p(units)` and invert with `expm1`.
 
 ## Recursive rollout

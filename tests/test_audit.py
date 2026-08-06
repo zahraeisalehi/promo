@@ -21,6 +21,8 @@ from promo.audit import (
     PROPENSITY_HIGH,
     PROPENSITY_LOW,
     UnobservedRowsError,
+    collisions,
+    horizon_check,
     overlap,
     variation_axes,
     write_diagnostics,
@@ -553,3 +555,219 @@ def test_real_overlap_diagnostics_are_json_serialisable(
     _, diag = real_overlap
     path = write_diagnostics(diag, tmp_path / "overlap.json")
     assert json.loads(path.read_text())["stage"] == "overlap"
+
+
+# --------------------------------------------------------------------------
+# Task 3.3 — collisions and horizon.
+# --------------------------------------------------------------------------
+
+
+def _collision_panel(rows: list[dict]) -> pd.DataFrame:
+    base = {
+        "PRODUCT_ID": 1,
+        "STORE_ID": 1,
+        "WEEK_NO": 1,
+        "units": 1,
+        "treated": False,
+        "in_mailer": False,
+        "treatment_observed": True,
+    }
+    return pd.DataFrame([{**base, **r} for r in rows])
+
+
+def test_all_four_cells_are_reported() -> None:
+    panel = _collision_panel(
+        [
+            {"treated": True, "in_mailer": True, "units": 4},
+            {"treated": True, "in_mailer": False, "units": 3},
+            {"treated": False, "in_mailer": True, "units": 2},
+            {"treated": False, "in_mailer": False, "units": 1},
+        ]
+    )
+    cells, _ = collisions(panel)
+    by_cell = cells.set_index("cell")
+    assert set(by_cell.index) == {
+        "treated_with_secondary",
+        "treated_clean",
+        "control_with_secondary",
+        "control_clean",
+    }
+    assert by_cell.loc["treated_with_secondary", "units"] == 4
+    assert by_cell.loc["control_with_secondary", "units"] == 2
+    assert cells["rows"].sum() == 4
+    assert cells["units_share"].sum() == pytest.approx(1.0)
+
+
+def test_collision_share_is_of_treated_rows() -> None:
+    panel = _collision_panel(
+        [{"treated": True, "in_mailer": True}]
+        + [{"treated": True, "in_mailer": False}] * 3
+        + [{"treated": False, "in_mailer": False}] * 6
+    )
+    _, diag = collisions(panel)
+    assert diag["collision"]["rows"] == 1
+    assert diag["collision"]["share_of_treated"] == pytest.approx(0.25)
+
+
+def test_contaminated_controls_are_counted_separately() -> None:
+    """The failure mode the plan's single collision count would miss.
+
+    An untreated row carrying a mailer is a promoted row sitting in the control
+    group. It biases the counterfactual up and the effect towards zero, which is
+    the opposite direction to a collision on a treated row.
+    """
+    panel = _collision_panel(
+        [{"treated": True, "in_mailer": False}] * 2
+        + [{"treated": False, "in_mailer": True}] * 3
+        + [{"treated": False, "in_mailer": False}] * 5
+    )
+    _, diag = collisions(panel)
+    assert diag["collision"]["rows"] == 0            # no treated row collides
+    assert diag["contaminated_controls"]["rows"] == 3
+    assert diag["contaminated_controls"]["share_of_controls"] == pytest.approx(3 / 8)
+    # Contamination alone must still trip the status.
+    assert diag["status"] == "OVERLAPPING_TREATMENTS"
+
+
+def test_a_clean_panel_is_separable() -> None:
+    panel = _collision_panel(
+        [{"treated": True, "in_mailer": False}] * 3
+        + [{"treated": False, "in_mailer": False}] * 7
+    )
+    _, diag = collisions(panel)
+    assert diag["status"] == "SEPARABLE"
+    assert diag["collision"]["rows"] == 0
+    assert diag["contaminated_controls"]["rows"] == 0
+
+
+def test_collision_threshold_is_a_parameter() -> None:
+    panel = _collision_panel(
+        [{"treated": True, "in_mailer": True}]
+        + [{"treated": True, "in_mailer": False}] * 9
+        + [{"treated": False, "in_mailer": False}] * 10
+    )
+    _, strict = collisions(panel, max_collision_share=0.05)
+    _, lenient = collisions(panel, max_collision_share=0.5)
+    assert strict["status"] == "OVERLAPPING_TREATMENTS"   # 10% collides
+    assert lenient["status"] == "SEPARABLE"
+    assert strict["threshold"] == 0.05
+
+
+def test_collisions_refuse_unobserved_rows() -> None:
+    panel = _collision_panel(
+        [{"treated": True}, {"treated": False, "treatment_observed": False}]
+    )
+    with pytest.raises(UnobservedRowsError):
+        collisions(panel)
+
+
+def _cycles(rows: list[tuple]) -> pd.DataFrame:
+    return pd.DataFrame(
+        rows, columns=["COMMODITY_DESC", "horizon_weeks", "low_support"]
+    )
+
+
+def test_a_short_horizon_is_flagged_with_its_shortfall() -> None:
+    campaigns = pd.DataFrame(
+        {"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [1]}
+    )
+    checked, diag = horizon_check(campaigns, _cycles([("SOUP", 5, False)]))
+    assert checked.iloc[0]["status"] == "HORIZON_TOO_SHORT"
+    assert checked.iloc[0]["shortfall_weeks"] == 4
+    assert diag["too_short"] == 1
+    assert diag["max_shortfall_weeks"] == 4
+
+
+def test_an_adequate_horizon_passes() -> None:
+    campaigns = pd.DataFrame({"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [9]})
+    checked, diag = horizon_check(campaigns, _cycles([("SOUP", 3, False)]))
+    assert checked.iloc[0]["status"] == "OK"
+    assert pd.isna(checked.iloc[0]["shortfall_weeks"])
+    assert diag["too_short"] == 0
+
+
+def test_an_exactly_equal_horizon_passes() -> None:
+    """The rule is 'at least the cycle', so equality clears it."""
+    campaigns = pd.DataFrame({"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [3]})
+    checked, _ = horizon_check(campaigns, _cycles([("SOUP", 3, False)]))
+    assert checked.iloc[0]["status"] == "OK"
+
+
+def test_an_unknown_cycle_is_not_a_pass() -> None:
+    """A commodity with no recorded cycle must not read as 'long enough'."""
+    campaigns = pd.DataFrame({"COMMODITY_DESC": ["GHOST"], "horizon_weeks": [99]})
+    checked, diag = horizon_check(campaigns, _cycles([("SOUP", 3, False)]))
+    assert checked.iloc[0]["status"] == "UNKNOWN_CYCLE"
+    assert diag["unknown_cycle"] == 1
+    assert diag["too_short"] == 0
+
+
+def test_a_null_cycle_is_also_unknown() -> None:
+    campaigns = pd.DataFrame({"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [4]})
+    cycles = pd.DataFrame(
+        {"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [pd.NA], "low_support": [True]}
+    )
+    checked, _ = horizon_check(campaigns, cycles)
+    assert checked.iloc[0]["status"] == "UNKNOWN_CYCLE"
+
+
+def test_low_support_cycles_are_checked_but_flagged() -> None:
+    campaigns = pd.DataFrame(
+        {"COMMODITY_DESC": ["SOUP", "BREAD"], "horizon_weeks": [1, 9]}
+    )
+    checked, diag = horizon_check(
+        campaigns, _cycles([("SOUP", 5, True), ("BREAD", 3, False)])
+    )
+    assert list(checked["status"]) == ["HORIZON_TOO_SHORT", "OK"]
+    assert bool(checked.iloc[0]["low_support"]) is True
+    assert diag["on_a_low_support_cycle"] == 1
+
+
+def test_horizon_check_does_not_duplicate_campaigns() -> None:
+    campaigns = pd.DataFrame(
+        {"COMMODITY_DESC": ["SOUP", "SOUP", "BREAD"], "horizon_weeks": [1, 9, 2]}
+    )
+    checked, diag = horizon_check(
+        campaigns, _cycles([("SOUP", 5, False), ("BREAD", 3, False)])
+    )
+    assert len(checked) == 3
+    assert diag["campaigns"] == 3
+
+
+def test_horizon_check_requires_its_columns() -> None:
+    with pytest.raises(KeyError, match="horizon_weeks"):
+        horizon_check(
+            pd.DataFrame({"COMMODITY_DESC": ["SOUP"]}), _cycles([("SOUP", 3, False)])
+        )
+    with pytest.raises(KeyError, match="not a column of the cycles"):
+        horizon_check(
+            pd.DataFrame({"COMMODITY_DESC": ["SOUP"], "horizon_weeks": [3]}),
+            pd.DataFrame({"COMMODITY_DESC": ["SOUP"]}),
+        )
+
+
+@real_data
+def test_real_display_and_mailer_collide_substantially() -> None:
+    cells, diag = collisions(PANEL)
+    assert diag["status"] == "OVERLAPPING_TREATMENTS"
+    assert 0.3 < diag["collision"]["share_of_treated"] < 0.5
+    assert 0.1 < diag["contaminated_controls"]["share_of_controls"] < 0.2
+    assert cells["rows"].sum() == diag["rows"]
+
+
+@real_data
+def test_real_horizon_check_runs_against_the_recorded_cycles() -> None:
+    """A two-week window fails for a fast commodity and for a slow one."""
+    cycles = Path("data/interim/repurchase_cycles.parquet")
+    if not cycles.exists():
+        pytest.skip("run Task 2.7 first")
+    campaigns = pd.DataFrame(
+        {
+            "COMMODITY_DESC": ["FLUID MILK PRODUCTS", "SOUP", "FLUID MILK PRODUCTS"],
+            "horizon_weeks": [2, 2, 12],
+        }
+    )
+    checked, diag = horizon_check(campaigns, cycles)
+    assert checked.iloc[0]["status"] == "HORIZON_TOO_SHORT"   # milk needs 3
+    assert checked.iloc[2]["status"] == "OK"
+    assert diag["too_short"] >= 1

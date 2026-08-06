@@ -310,7 +310,42 @@ This is your first demoable checkpoint. If everything after this failed, you wou
 
 ### Task 4.1 — Train
 
-> **Prompt:** Write `promo/baseline.py`. Fit LightGBM on `treated == 0` rows only, predicting log1p(units) from the Phase 2 features. Raise if treated rows are present in the training frame. Add quantile variants at 0.1, 0.5, 0.9.
+> **Prompt:** Write `promo/baseline.py`. Fit LightGBM on `treated == 0` rows only, predicting log1p(units) from the Phase 2 features **plus `in_mailer`**. Raise if treated rows are present in the training frame. Add quantile variants at 0.1, 0.5, 0.9.
+
+### `in_mailer` is a covariate here, and that is deliberate
+
+Settled decision 8 (`docs/data_findings.md`), arising from Task 3.3. Decision 4
+already said "`mailer` is retained as a control covariate, never as the
+treatment" — but the Phase 2.6 feature set never contained it, so the decision
+was documented and not implemented.
+
+**Why it has to be in.** The baseline trains on `treated == 0` rows, and
+**13.06% of those control rows carry a mailer**. They were promoted; the model
+is told nothing about it; it learns an inflated normal. The counterfactual comes
+out too high and **every measured display effect is biased towards zero**. That
+is 339,613 rows and 22.11% of panel units silently lifting the baseline.
+
+**This does not weaken the no-promotion-features rule.** That rule keeps the
+counterfactual from seeing *the promotion being measured*. `in_mailer` is a
+different mechanic, is not derived from `display`, is known before the display
+decision, and is not a post-treatment aggregate. Conditioning on a concurrent
+treatment is what avoids omitted-variable bias. **Depth, `on_deal` and the
+discount columns stay out** — this admits exactly one flag and nothing else.
+
+**Two things it does not fix, and both must be handled here:**
+
+1. **39.80% of treated rows carry both mechanics.** Holding `in_mailer` fixed at
+   True holds an interaction fixed rather than removing it, so those rows still
+   identify a *joint* display-and-mailer effect. **Report them separately from
+   the clean 60.20%** — never pool the two into one "display effect".
+2. When rolling out a counterfactual for a treated row, `in_mailer` takes its
+   **observed** value. The question is what the row would have done with the
+   mailer that actually ran and without the display.
+
+**Note for whoever implements this:** `.claude/rules/causal-inference.md` reads
+"no promo flag" without qualification. The reconciliation above is the intended
+reading, not an exception to it, but the rule's wording predates this decision
+and should be read alongside it.
 
 ### Task 4.2 — Rollout
 

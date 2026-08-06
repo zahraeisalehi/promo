@@ -142,6 +142,59 @@ panel holds, so only ~483k of 36.8M rows are ever materialised — then joins wi
 `validate="one_to_one"` and raises `CoverageError` if the row count moves. The
 615 silently duplicated keys Task 1.4 found in a naive join cannot recur.
 
+**Added in Task 3.3:** an eighth settled decision, on the baseline's covariates.
+
+| # | Decision | From |
+|---|---|---|
+| 8 | **`in_mailer` joins the baseline feature set as a control covariate.** Not as a treatment. | Task 3.3 |
+
+**On (8): the decision was already recorded, it was never implemented.** Settled
+decision 4 states that "`mailer` is retained as a control covariate, never as
+the treatment". The Phase 2.6 feature set does not contain it. Decision 4 was
+documented and not carried out, and Task 3.3 is what surfaced the gap.
+
+**What it costs to leave it out.** The Phase 4 baseline trains on `treated == 0`
+rows. **13.06% of those control rows carry a mailer** — they were promoted, and
+the model is told nothing about it. It learns an inflated normal, the
+counterfactual is fitted too high, and **every measured display effect is biased
+towards zero**. That is 339,613 rows and 22.11% of panel units quietly lifting
+the baseline.
+
+**This makes `in_mailer` a control, not a treatment.** The treatment is still
+`display` alone. The counterfactual for a treated row holds the mailer at its
+observed value, which is what isolates the display effect: *what would this row
+have done with the mailer that actually ran and without the display*.
+
+**Reconciling with the causal-inference rule.** `.claude/rules/causal-inference.md`
+says features "may not include anything derived from the promotion: no discount
+depth, no promo flag, no post-treatment aggregates". `in_mailer` is a promo flag,
+so the reconciliation must be explicit rather than assumed:
+
+- The rule exists to stop the counterfactual seeing **the promotion being
+  measured**. `in_mailer` is a *different* mechanic, and conditioning on other
+  treatments is what prevents omitted-variable bias rather than causing leakage.
+- `in_mailer` is not derived from `display`, is known before the display
+  decision, and is not a post-treatment aggregate.
+- Depth, `on_deal` and the discount columns remain excluded. This decision
+  admits exactly one flag and nothing else.
+
+**Alternatives considered and rejected:**
+
+1. **Restrict controls to mailer-free rows.** Discards 339,613 rows of control
+   mass — 22.11% of panel units — to solve by deletion what a covariate solves
+   by conditioning.
+2. **Report a joint display-and-mailer effect.** Answers a different question
+   than decision 4 asks. Decision 4 chose `display` precisely because it varies
+   across stores within a week and `mailer` does not; merging them discards that.
+
+**What the covariate does not fix.** **39.80% of treated rows carry both
+mechanics.** For those, the estimate remains a joint effect — the display effect
+*conditional on a mailer also running* — because holding `in_mailer` fixed at
+True is holding an interaction fixed, not removing it. Those rows must be
+**reported separately from the clean 60.20%**, not pooled into a single "display
+effect". Adding the covariate fixes the control group; it does not purify the
+treated group.
+
 ---
 
 ## Task 1.1 — Shape and coverage
@@ -1518,3 +1571,80 @@ The `seed` parameter is inert under `cv="group"`: `GroupKFold` does not shuffle
 and the learner has no stochastic component at these settings. It bites only
 under `cv="random"`. Pinned by a test so a seed sweep is not mistaken for a
 robustness check.
+
+---
+
+## Task 3.3 — Collisions and horizon
+
+Reproduce: `promo.audit.collisions()` and `promo.audit.horizon_check()`;
+collision result in `data/interim/collisions_diagnostics.json`.
+
+### Display and mailer collide on two fifths of treated rows
+
+**Status: `OVERLAPPING_TREATMENTS`.**
+
+| cell | rows | row share | units | unit share |
+|---|---:|---:|---:|---:|
+| treated **with** mailer | 145,812 | 4.92% | 79,233 | 10.79% |
+| treated, clean | 220,534 | 7.43% | 68,920 | 9.38% |
+| control **with** mailer | 339,613 | 11.45% | 162,371 | 22.11% |
+| control, clean | 2,260,369 | 76.20% | 423,933 | 57.72% |
+
+- **39.80% of treated rows also carry a mailer.** On those rows the estimand is
+  the joint effect of display *and* mailer, not of display alone.
+- **13.06% of control rows carry a mailer.** These are promoted rows sitting in
+  the control group.
+
+### The second figure is the one the plan's check would have missed
+
+The plan asks for product-store-weeks "where display and mailer both fire and
+are being treated as one effect" — the first row of that table. The second is
+worse and easier to miss.
+
+A control row carrying a mailer is untreated by the `display` definition but was
+promoted. It enters the Phase 4 baseline's training set, where its units are
+lifted by a promotion the model is told nothing about. The counterfactual is
+fitted **too high**, and the measured display effect is biased **towards zero**.
+
+**The two biases push opposite ways and do not cancel**, because they act on
+different rows: collisions inflate the effect by crediting display with the
+mailer's work, contamination deflates it by raising the baseline. In unit terms
+the contamination is the larger of the two — 22.11% of panel units against
+10.79%.
+
+Three responses are recorded in the diagnostics, none taken here because the
+choice belongs to Phase 4's estimator design:
+
+1. Restrict to rows where `in_mailer` is false — a clean display effect on a
+   much smaller panel: 76.20% of rows survive but only 57.72% of units.
+2. Keep `in_mailer` as a **covariate** so the model can separate them. This is
+   what settled decision 4 assumes ("`mailer` is retained as a control
+   covariate") — **and the Phase 2.6 feature set does not include it.** That is
+   a gap between the recorded decision and the built panel, surfaced here.
+3. Report the joint effect and label it as joint.
+
+### The horizon check takes campaigns, it does not invent them
+
+Phase 3's objective is a verdict "for any **proposed** campaign", so
+`horizon_check()` compares a supplied campaign table against the Task 2.7
+cycles rather than deriving campaigns from the panel. What constitutes a
+campaign is left to the caller, as the plan intends.
+
+Statuses are three, not two:
+
+| status | meaning |
+|---|---|
+| `OK` | horizon ≥ the commodity's recorded cycle (equality clears it) |
+| `HORIZON_TOO_SHORT` | with the shortfall in weeks |
+| `UNKNOWN_CYCLE` | no cycle recorded, or the campaign has no horizon |
+
+**An unknown cycle is never a pass.** A commodity absent from the cycles table,
+or one whose cycle is null because it had no gap to measure, returns
+`UNKNOWN_CYCLE` so it cannot be read as "long enough". Cycles flagged
+`low_support` are checked but carry the flag through: a median over a handful of
+gaps is a weak requirement, not a safe one.
+
+**Clearing the check is necessary and not sufficient.** Task 2.7 established
+every recorded cycle is a floor — one-week-only pairs contribute no gap and are
+the slowest buyers, and gaps are right-censored at 102 weeks. The diagnostics
+say so in the `floors_not_estimates` field rather than only here.
