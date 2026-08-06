@@ -23,6 +23,8 @@ from promo.baseline import (
     ESTIMATION_WINDOW,
     FORBIDDEN_FEATURES,
     IDENTITY_FEATURES,
+    MEDIATOR_FEATURES,
+    TARGETS,
     BaselineModel,
     ForbiddenFeatureError,
     OutcomeLeakError,
@@ -177,6 +179,25 @@ def test_in_mailer_is_a_feature_and_the_deal_columns_are_not():
         assert banned in FORBIDDEN_FEATURES
 
 
+def test_the_mediator_block_is_out_but_still_reachable():
+    """Settled decision 13, and the escape hatch that keeps it checkable.
+
+    The three are excluded because the promotion moves them, so conditioning on
+    them absorbs part of the effect. They are not *forbidden* — the two-by-two
+    that settled it has to be able to put them back, and a future re-measurement
+    has to be able to overturn it.
+    """
+    for column in MEDIATOR_FEATURES:
+        assert column not in BASELINE_FEATURES
+        assert column not in FORBIDDEN_FEATURES
+    assert len(BASELINE_FEATURES) == 12
+
+    panel = _panel(n_pairs=14, n_weeks=30, seed=31)
+    model, diag = _fit(panel, features=(*BASELINE_FEATURES, *MEDIATOR_FEATURES))
+    assert len(model.features) == 15
+    assert set(MEDIATOR_FEATURES) <= set(diag["features"]["columns"])
+
+
 def test_a_forbidden_feature_is_refused():
     panel = _panel(seed=5)
     with pytest.raises(ForbiddenFeatureError) as exc:
@@ -291,18 +312,26 @@ def test_diagnostics_state_the_mailer_covariate_decision():
 # --- the fit itself ----------------------------------------------------------
 
 
-def test_predictions_are_non_negative_and_round_trip_the_log_scale():
+def test_predictions_are_non_negative_and_invert_their_own_target():
     panel = _panel(n_pairs=14, n_weeks=30, seed=8)
-    model, _ = _fit(panel)
     # Predicting takes the same derived column the fit used — see Task 4.2's
     # rollout, which will call add_price_history for the same reason.
     scored = add_price_history(panel)
 
-    units = model.predict(scored)
-    log_units = model.predict_log1p(scored)
-
+    log1p_model, _ = _fit(panel, target="log1p")
+    units = log1p_model.predict(scored)
     assert (units >= 0).all()
-    assert np.allclose(units, np.clip(np.expm1(log_units), 0.0, None))
+    assert np.allclose(
+        units, np.clip(np.expm1(log1p_model.predict_raw(scored)), 0.0, None)
+    )
+
+    # tweedie predicts the conditional mean directly: raw output is units, so
+    # there is no inversion to get wrong.
+    tweedie, _ = _fit(panel, target="tweedie")
+    assert np.allclose(
+        tweedie.predict(scored), np.clip(tweedie.predict_raw(scored), 0.0, None)
+    )
+    assert (tweedie.predict(scored) >= 0).all()
 
 
 def test_quantiles_are_ordered_on_most_rows_and_crossings_are_reported():
@@ -322,6 +351,92 @@ def test_quantiles_are_ordered_on_most_rows_and_crossings_are_reported():
     assert "Sorting them would make the interval look coherent" in (
         crossing["why_not_repaired"]
     )
+
+
+def test_the_smearing_factor_corrects_the_mean_and_leaves_quantiles_alone():
+    """Duan's correction targets the conditional mean, which quantiles are not.
+
+    A quantile of `log1p(units)` inverts to that quantile of units under
+    `expm1` with no correction, because quantiles are equivariant under a
+    monotone transform. Multiplying them by the smearing factor would widen the
+    band for no reason, so the two paths must differ in exactly one place.
+    """
+    panel = _panel(n_pairs=20, n_weeks=40, seed=26)
+    scored = add_price_history(panel)
+
+    plain, plain_diag = _fit(panel, target="log1p")
+    smeared, smeared_diag = _fit(panel, target="log1p_smearing")
+
+    # Measured on both paths; applied by one. The plain path's measured value
+    # is the bias it is carrying without saying so.
+    assert plain_diag["model"]["smearing_factor_applied"] == 1.0
+    assert plain_diag["model"]["smearing_factor_measured"] > 1.0
+    factor = smeared_diag["model"]["smearing_factor_applied"]
+    assert factor > 1.0  # residual spread always pushes the mean above expm1
+
+    # Same booster, different inversion: the mean moves up by the factor.
+    assert np.allclose(smeared.predict_raw(scored), plain.predict_raw(scored))
+    expected = np.clip(np.exp(plain.predict_raw(scored)) * factor - 1.0, 0.0, None)
+    assert np.allclose(smeared.predict(scored), expected)
+    assert smeared.predict(scored).sum() > plain.predict(scored).sum()
+
+    # The quantiles do not move.
+    for quantile in (0.1, 0.9):
+        assert np.allclose(
+            smeared.predict(scored, quantile), plain.predict(scored, quantile)
+        )
+
+
+@pytest.mark.parametrize("target", ["tweedie", "poisson"])
+def test_the_count_objectives_need_no_retransformation(target: str):
+    panel = _panel(n_pairs=20, n_weeks=40, seed=27)
+    model, diag = _fit(panel, target=target)
+
+    assert diag["model"]["objectives"][0] == target
+    assert diag["model"]["fitted_on"] == "units"
+    assert "none" in diag["model"]["inverse"]
+    assert diag["model"]["smearing_factor_applied"] == 1.0
+    assert model.target == target
+
+
+def test_the_backtest_follows_the_target_it_is_validating():
+    """Regression: the backtest hardcoded log1p and did not notice the change.
+
+    When the default moved to Poisson, this block went on fitting and inverting
+    the old way, and reported numbers byte-identical to the previous run. A
+    validation that does not track what it validates reads as evidence while
+    being none, so the target is asserted here rather than assumed.
+    """
+    panel = _panel(n_pairs=20, n_weeks=40, seed=30)
+
+    _, poisson = _fit(panel, target="poisson", backtest_weeks=8)
+    _, log1p = _fit(panel, target="log1p", backtest_weeks=8)
+
+    assert poisson["backtest"]["target"] == "poisson"
+    assert log1p["backtest"]["target"] == "log1p"
+    # Different objectives on the same split cannot give the same error.
+    assert poisson["backtest"]["mae_units"] != log1p["backtest"]["mae_units"]
+
+
+def test_an_unknown_target_is_refused():
+    with pytest.raises(ValueError, match="target must be one of"):
+        _fit(_panel(n_pairs=7, n_weeks=25, seed=28), target="log")
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_every_target_survives_a_save_and_load(target: str):
+    panel = _panel(n_pairs=14, n_weeks=30, seed=29)
+    model, _ = _fit(panel, target=target)
+    scored = add_price_history(panel)
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save(tmp)
+        reloaded = BaselineModel.load(tmp)
+    assert reloaded.target == target
+    assert reloaded.smearing_factor == pytest.approx(model.smearing_factor)
+    assert np.allclose(reloaded.predict(scored), model.predict(scored))
 
 
 def test_the_same_seed_gives_the_same_predictions():

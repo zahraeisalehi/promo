@@ -27,6 +27,26 @@ omitted-variable bias. Depth, `on_deal`, `price_status` and the discount columns
 stay out — `FORBIDDEN_FEATURES` enforces that, so the exception is exactly one
 flag wide.
 
+**The three mediator features are out.** `n_stores_carrying`,
+`category_units_ex_focal` and `store_traffic` are measured in week *w* and can
+be moved by the promotion itself, so conditioning on them absorbs part of the
+effect being measured — Task 2.6 flagged them and Task 3.2 deferred the
+question. Task 4.4 settled it by recovery: dropping them roughly halves the
+bias at a true effect of zero. See settled decision 13 for why the first
+measurement said the opposite. `fit_baseline(features=BASELINE_FEATURES +
+MEDIATOR_FEATURES)` puts them back.
+
+**The outcome is fitted directly, not through a log.** The obvious target for a
+count is `log1p(units)` inverted with `expm1`, and it is wrong on a panel with
+mass at zero: `expm1` of a conditional mean in log space lands nearer the
+conditional *median*, understating the counterfactual, and the rollout feeds
+that understatement back until it compounds. Task 4.4 measured a 17% one-step
+shortfall at 10% no-sale weeks, decaying to 55% by the seventh step, and a true
+effect of zero coming back as +0.28 of counterfactual units. A Poisson
+objective on raw units predicts the conditional mean directly — nothing to
+invert, nothing to correct — and brings that to +0.017. See `TARGETS` for the
+full comparison and for the two rejected alternatives, both kept runnable.
+
 **A feature's missingness may not be the outcome either.** Phase 2.6 asserts
 that no lag uses the current week's outcome, but it checks lag *values*, not
 column *availability*. `price_rel_category` is null on exactly the 2,046,518
@@ -69,13 +89,17 @@ from promo.io import connect
 
 __all__ = [
     "BASELINE_FEATURES",
+    "DEFAULT_TARGET",
     "DERIVED_FROM",
     "ESTIMATION_WINDOW",
     "FORBIDDEN_FEATURES",
     "IDENTITY_FEATURES",
+    "MEDIATOR_FEATURES",
     "MISSINGNESS_LEAK_THRESHOLD",
     "QUANTILES",
     "RECURSIVE_FEATURES",
+    "TARGETS",
+    "TWEEDIE_VARIANCE_POWER",
     "BaselineModel",
     "ForbiddenFeatureError",
     "NonContiguousWeeksError",
@@ -90,16 +114,26 @@ __all__ = [
     "write_diagnostics",
 ]
 
-#: The Phase 2.6 feature set plus `in_mailer` — settled decision 8 — with
-#: `price_rel_category` replaced by its carried-forward form. The Phase 2 names
+#: The three week-*w* features the promotion can itself move — settled decision
+#: 13. Excluded from `BASELINE_FEATURES`; `fit_baseline(features=...)` can put
+#: them back, which is how the two-by-two that settled it stays runnable.
+MEDIATOR_FEATURES: tuple[str, ...] = (
+    "n_stores_carrying",
+    "category_units_ex_focal",
+    "store_traffic",
+)
+
+#: The Phase 2.6 feature set plus `in_mailer` (settled decision 8), with
+#: `price_rel_category` replaced by its carried-forward form (decision 9) and
+#: the mediator block removed (decision 13) — twelve columns. The Phase 2 names
 #: are imported rather than retyped so a change there cannot silently leave the
-#: baseline fitting on a stale list. See `DERIVED_FROM` for the substitution and
-#: the leak that forces it.
+#: baseline fitting on a stale list.
 BASELINE_FEATURES: tuple[str, ...] = (
     *LAGGED_FEATURES,
     *(
         "price_rel_category_lag" if c == "price_rel_category" else c
         for c in CONTEMPORANEOUS_FEATURES
+        if c not in MEDIATOR_FEATURES
     ),
     "in_mailer",
 )
@@ -307,6 +341,46 @@ def missingness_coupling(
     return measurements, leaking
 
 
+#: What the mean model is fitted on, and therefore how its output becomes units.
+#:
+#: - `log1p` — regression on `log1p(units)`, inverted with `expm1`. **Biased low
+#:   on a zero-inflated outcome**: `expm1` of a conditional mean in log space is
+#:   nearer the conditional median than the conditional mean, and the gap grows
+#:   with the mass at zero. Task 4.4 measured it at 17% one-step on a panel with
+#:   10% no-sale weeks, compounding to 55% by the seventh rollout step.
+#: - `log1p_smearing` — the same fit, inverted with Duan's smearing factor
+#:   estimated from the training residuals, which targets the conditional mean.
+#: - `tweedie`, `poisson` — fitted on raw units with a log link. The booster's
+#:   output *is* the conditional mean, so there is no retransformation to correct
+#:   and zero-inflation is handled by the likelihood rather than around it.
+#:
+#: **`poisson` is the default**, on the Task 4.4 measurement rather than on
+#: taste. Recovering a true effect of zero, bias as a share of counterfactual
+#: units, three seeds per cell:
+#:
+#: | no-sale rate |  0% |  5% |   10% |   20% |
+#: |--------------|----:|----:|------:|------:|
+#: | log1p        |-.029|.122 | **.277** | **.444** |
+#: | log1p_smearing|-.052|-.025| .041  | .099  |
+#: | tweedie      |-.058|-.021| .043  | .085  |
+#: | poisson      |-.050|-.022| **.017** | **.058** |
+#:
+#: Both fixes work; the one that never transforms wins at the sparsity that
+#: matters, and the real panel is 87% zero rows. `log1p` is kept so the
+#: comparison stays reproducible and so the defect it carries stays visible.
+TARGETS: tuple[str, ...] = ("log1p", "log1p_smearing", "tweedie", "poisson")
+
+#: The target the pipeline fits with unless a caller says otherwise.
+DEFAULT_TARGET: str = "poisson"
+
+#: Targets whose booster output is already on the units scale.
+_DIRECT_TARGETS: frozenset[str] = frozenset({"tweedie", "poisson"})
+
+#: Compound Poisson-gamma. Between 1 and 2: a point mass at zero with a
+#: continuous positive part, which is the shape of a product-store-week.
+TWEEDIE_VARIANCE_POWER: float = 1.3
+
+
 def _quantile_key(alpha: float) -> str:
     return f"q{round(alpha * 100):02d}"
 
@@ -331,6 +405,11 @@ class BaselineModel:
     #: Categories seen at fit time, per categorical feature, so `load()` can put
     #: the same encoding back. Empty when `include_identity=False`.
     categories: dict[str, list[Any]] = field(default_factory=dict)
+    #: One of `TARGETS`. Decides how the booster's output becomes units.
+    target: str = "log1p"
+    #: Duan's smearing factor, `mean(exp(training residual))` in log space. Used
+    #: only by `log1p_smearing`, and only for the mean — see `predict`.
+    smearing_factor: float = 1.0
 
     def design(self, frame: pd.DataFrame) -> pd.DataFrame:
         """The model matrix for `frame`, in the order the boosters were fitted.
@@ -347,10 +426,14 @@ class BaselineModel:
             )
         return _prepare(frame[list(self.features)], self.categorical, self.categories)
 
-    def predict_log1p(
+    def predict_raw(
         self, frame: pd.DataFrame, quantile: float | None = None
     ) -> np.ndarray:
-        """Prediction on the fitted scale, log1p(units)."""
+        """The booster's own output, before any inversion.
+
+        `log1p(units)` under the log1p targets; units under `tweedie` and
+        `poisson`, whose log link is applied inside LightGBM.
+        """
         booster = self.boosters[
             "mean" if quantile is None else _quantile_key(quantile)
         ]
@@ -359,13 +442,30 @@ class BaselineModel:
     def predict(
         self, frame: pd.DataFrame, quantile: float | None = None
     ) -> np.ndarray:
-        """Counterfactual units. `expm1` of the fitted scale, floored at zero.
+        """Counterfactual units, floored at zero.
+
+        How the booster's output becomes units depends on `target`:
+
+        - `tweedie` / `poisson` — it already is the conditional mean.
+        - `log1p` — `expm1`, which returns something closer to the conditional
+          median than the mean once the outcome has mass at zero.
+        - `log1p_smearing` — `exp(raw) * S - 1` with Duan's smearing factor `S`,
+          which targets the conditional mean. **The correction applies to the
+          mean only.** Quantiles are equivariant under a monotone transform, so
+          `expm1` of a log-scale quantile already *is* that quantile of units;
+          multiplying it by `S` would inflate the band for no reason.
 
         The floor is the only repair in this module and it is a range
-        constraint, not an imputation: `expm1` of a small negative prediction is
-        a negative unit count, which is not a quantity.
+        constraint, not an imputation: a negative unit count is not a quantity.
         """
-        return np.clip(np.expm1(self.predict_log1p(frame, quantile)), 0.0, None)
+        raw = self.predict_raw(frame, quantile)
+        if self.target in _DIRECT_TARGETS:
+            units = raw
+        elif self.target == "log1p_smearing" and quantile is None:
+            units = np.exp(raw) * self.smearing_factor - 1.0
+        else:
+            units = np.expm1(raw)
+        return np.clip(units, 0.0, None)
 
     def importances(self, importance_type: str = "gain") -> pd.DataFrame:
         """Every feature's importance in the mean model, ranked."""
@@ -399,6 +499,8 @@ class BaselineModel:
             "n_train_rows": self.n_train_rows,
             "seed": self.seed,
             "boosters": sorted(self.boosters),
+            "target": self.target,
+            "smearing_factor": self.smearing_factor,
         }
         (path / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
         return path
@@ -423,6 +525,8 @@ class BaselineModel:
             n_train_rows=meta["n_train_rows"],
             seed=meta["seed"],
             categories={k: list(v) for k, v in meta.get("categories", {}).items()},
+            target=meta.get("target", "log1p"),
+            smearing_factor=meta.get("smearing_factor", 1.0),
         )
 
 
@@ -774,6 +878,7 @@ def fit_baseline(
     con: duckdb.DuckDBPyConnection | None = None,
     features: tuple[str, ...] | list[str] | None = None,
     include_identity: bool = False,
+    target: str = DEFAULT_TARGET,
     quantiles: tuple[float, ...] = QUANTILES,
     treatment_column: str = "treated",
     week_range: tuple[int, int] | None = ESTIMATION_WINDOW,
@@ -799,6 +904,10 @@ def fit_baseline(
         include_identity: also fit on PRODUCT_ID, STORE_ID and COMMODITY_DESC as
             categoricals. Off by default: the lags carry the level, and a fit
             keyed on 300 particular products does not transfer beyond the scope.
+        target: one of `TARGETS`. Decides what the mean model is fitted on and
+            how its output becomes units. `log1p` is retained so the Task 4.4
+            comparison stays reproducible; see `TARGETS` for why it is not the
+            default any more.
         quantiles: alphas for the quantile variants.
         treatment_column: the boolean that must be False on every training row.
         week_range: inclusive `(first, last)` week. Settled decision 5.
@@ -827,6 +936,8 @@ def fit_baseline(
             f"num_leaves={num_leaves} exceeds the CLAUDE.md ceiling of 63 on "
             f"this machine."
         )
+    if target not in TARGETS:
+        raise ValueError(f"target must be one of {list(TARGETS)}, got {target!r}")
     names, identity = _resolve_features(features, include_identity)
 
     frame, frame_diag = control_rows(
@@ -856,7 +967,12 @@ def fit_baseline(
         c: sorted(pd.Series(frame[c]).dropna().unique().tolist()) for c in identity
     }
     design = _prepare(frame[list(names)], identity, categories)
-    target = np.log1p(frame["units"].to_numpy(dtype="float64"))
+    observed = frame["units"].to_numpy(dtype="float64")
+    # tweedie and poisson are fitted on units directly — their log link lives
+    # inside LightGBM, so there is no retransformation to get wrong afterwards.
+    fit_target = (
+        observed if target in _DIRECT_TARGETS else np.log1p(observed)
+    )
 
     params = {
         "learning_rate": learning_rate,
@@ -872,17 +988,29 @@ def fit_baseline(
     }
 
     boosters = _fit_all(
-        lgb, design, target, params, n_estimators, quantiles, identity, seed
+        lgb, design, fit_target, params, n_estimators, quantiles, identity,
+        seed, target,
     )
+    # Measured for both log1p paths, applied by only one. The measurement on
+    # the plain path is the size of the bias it is carrying uncorrected, which
+    # is worth reporting even where nothing is done about it.
+    measured_smearing = _smearing_factor(boosters["mean"], design, fit_target, target)
+    smearing = measured_smearing if target == "log1p_smearing" else 1.0
     model = BaselineModel(
         boosters=boosters,
         features=names,
         categorical=identity,
-        params={**params, "n_estimators": n_estimators, "objective": "regression"},
+        params={
+            **params,
+            "n_estimators": n_estimators,
+            "objective": _mean_objective(target),
+        },
         train_window=tuple(week_range) if week_range else (0, 0),  # type: ignore[arg-type]
         n_train_rows=len(frame),
         seed=seed,
         categories=categories,
+        target=target,
+        smearing_factor=smearing,
     )
 
     fitted = {
@@ -892,7 +1020,7 @@ def fit_baseline(
     crossing = _quantile_crossing(fitted, quantiles)
     backtest = _backtest(
         lgb, frame, names, identity, categories, params, n_estimators,
-        quantiles, backtest_weeks, seed,
+        quantiles, backtest_weeks, seed, target, names,
     )
     _, strata_diag = mechanic_strata(
         panel, con=con, treatment_column=treatment_column, week_range=week_range
@@ -985,9 +1113,32 @@ def fit_baseline(
         "treated_strata": strata_diag,
         "model": {
             "estimator": "lgb.train",
-            "objectives": ["regression", *[f"quantile@{a}" for a in quantiles]],
-            "target": "log1p(units)",
-            "inverse": "expm1, clipped at zero",
+            "objectives": [
+                _mean_objective(target),
+                *[f"quantile@{a}" for a in quantiles],
+            ],
+            "target": target,
+            "fitted_on": "units" if target in _DIRECT_TARGETS else "log1p(units)",
+            "inverse": {
+                "log1p": "expm1, clipped at zero",
+                "log1p_smearing": (
+                    f"exp(raw) * {smearing:.4f} - 1 for the mean, expm1 for the "
+                    f"quantiles, clipped at zero"
+                ),
+                "tweedie": "none — the booster predicts the conditional mean",
+                "poisson": "none — the booster predicts the conditional mean",
+            }[target],
+            "smearing_factor_applied": round(smearing, 6),
+            "smearing_factor_measured": round(measured_smearing, 6),
+            "smearing_note": (
+                "Duan's factor, mean(exp(training residual)) in log space, "
+                "measured on both log1p paths and applied only by "
+                "log1p_smearing. On the plain path the measured value is the "
+                "retransformation bias the fit is carrying uncorrected: expm1 "
+                "understates the conditional mean by roughly this factor. It is "
+                "applied to the mean only — quantiles are equivariant under "
+                "expm1 and need no correction."
+            ),
             "n_estimators": n_estimators,
             **{k: v for k, v in params.items() if k != "verbose"},
         },
@@ -995,7 +1146,7 @@ def fit_baseline(
         "feature_importances": importances.to_dict(orient="records"),
         "backtest": backtest,
         "in_sample": _error_summary(
-            frame["units"].to_numpy(dtype="float64"), fitted["mean"]
+            frame["units"].to_numpy(dtype="float64"), model.predict(frame)
         ),
         "in_sample_caveat": (
             "In-sample fit on control rows. It is not evidence the effect "
@@ -1009,30 +1160,46 @@ def fit_baseline(
     return model, diagnostics
 
 
+def _mean_objective(target: str) -> str:
+    """The LightGBM objective the mean model is fitted with."""
+    if target in _DIRECT_TARGETS:
+        return target
+    return "regression"
+
+
 def _fit_all(
     lgb: Any,
     design: pd.DataFrame,
-    target: np.ndarray,
+    fit_target: np.ndarray,
     params: dict[str, Any],
     n_estimators: int,
     quantiles: tuple[float, ...],
     categorical: tuple[str, ...],
     seed: int,
+    target: str = "log1p",
 ) -> dict[str, Any]:
-    """The mean fit and one independent fit per quantile."""
+    """The mean fit and one independent fit per quantile.
+
+    The quantile models are always plain quantile regressions on whatever scale
+    the mean model was given. Quantiles are equivariant under a monotone
+    transform, so a quantile of `log1p(units)` inverts to that quantile of units
+    with no correction — which is exactly why the smearing factor must not touch
+    them.
+    """
     cat = list(categorical) if categorical else "auto"
     dataset = lgb.Dataset(
         design,
-        target,
+        fit_target,
         params={"max_bin": params["max_bin"], "verbose": -1},
         categorical_feature=cat,
         free_raw_data=False,
     )
-    boosters = {
-        "mean": lgb.train(
-            {**params, "objective": "regression"}, dataset, num_boost_round=n_estimators
+    mean_params = {**params, "objective": _mean_objective(target)}
+    if target == "tweedie":
+        mean_params["tweedie_variance_power"] = params.get(
+            "tweedie_variance_power", TWEEDIE_VARIANCE_POWER
         )
-    }
+    boosters = {"mean": lgb.train(mean_params, dataset, num_boost_round=n_estimators)}
     for alpha in quantiles:
         boosters[_quantile_key(alpha)] = lgb.train(
             {**params, "objective": "quantile", "alpha": alpha},
@@ -1040,6 +1207,26 @@ def _fit_all(
             num_boost_round=n_estimators,
         )
     return boosters
+
+
+def _smearing_factor(
+    booster: Any, design: pd.DataFrame, fit_target: np.ndarray, target: str
+) -> float:
+    """Duan's smearing factor: `mean(exp(residual))` in log space.
+
+    For `log1p(y) = f(x) + e`, `E[y + 1 | x] = exp(f(x)) * E[exp(e)]`, so the
+    conditional mean of units is `exp(f(x)) * S - 1`. Inverting with `expm1`
+    alone silently sets `S = 1`, which is only true when the residuals have no
+    spread — and a zero-inflated outcome has plenty.
+
+    Estimated in-sample, which is the standard form and is stated here because
+    it matters: an overfitted mean model has small residuals and returns a
+    factor near 1, understating the correction it needs.
+    """
+    if target not in {"log1p", "log1p_smearing"}:
+        return 1.0
+    predicted = np.asarray(booster.predict(design), dtype="float64")
+    return float(np.mean(np.exp(fit_target - predicted)))
 
 
 def _quantile_crossing(
@@ -1084,12 +1271,21 @@ def _backtest(
     quantiles: tuple[float, ...],
     backtest_weeks: int,
     seed: int,
+    target: str = DEFAULT_TARGET,
+    features: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Refit on all but the last N weeks and score the held-out ones.
 
     A time split, not a random one: a random split puts adjacent weeks of the
     same product-store on both sides, and they share their lagged units almost
     exactly.
+
+    The held-out fit goes through a real `BaselineModel`, so it inverts exactly
+    the way the shipped model does. An earlier version hardcoded `log1p` and
+    `expm1` here: when the default target changed, the backtest silently went on
+    measuring the old path and reported numbers identical to the previous run.
+    A validation block that does not track the thing it validates is worse than
+    none, because it looks like evidence.
     """
     caveat = (
         "Backtest error on untreated weeks is necessary and not sufficient. It "
@@ -1115,16 +1311,32 @@ def _backtest(
         }
 
     train = _prepare(frame.loc[train_mask, list(names)], categorical, categories)
-    test = _prepare(frame.loc[test_mask, list(names)], categorical, categories)
-    y_train = np.log1p(frame.loc[train_mask, "units"].to_numpy(dtype="float64"))
+    observed_train = frame.loc[train_mask, "units"].to_numpy(dtype="float64")
+    y_train = (
+        observed_train if target in _DIRECT_TARGETS else np.log1p(observed_train)
+    )
     y_test = frame.loc[test_mask, "units"].to_numpy(dtype="float64")
 
     boosters = _fit_all(
-        lgb, train, y_train, params, n_estimators, quantiles, categorical, seed
+        lgb, train, y_train, params, n_estimators, quantiles, categorical, seed,
+        target,
     )
+    measured = _smearing_factor(boosters["mean"], train, y_train, target)
+    held_out = BaselineModel(
+        boosters=boosters,
+        features=tuple(features or names),
+        categorical=categorical,
+        categories=categories,
+        target=target,
+        smearing_factor=measured if target == "log1p_smearing" else 1.0,
+    )
+    test_frame = frame.loc[test_mask]
     predicted = {
-        key: np.clip(np.expm1(booster.predict(test)), 0.0, None)
-        for key, booster in boosters.items()
+        "mean": held_out.predict(test_frame),
+        **{
+            _quantile_key(alpha): held_out.predict(test_frame, alpha)
+            for alpha in quantiles
+        },
     }
 
     lo_key, hi_key = _quantile_key(min(quantiles)), _quantile_key(max(quantiles))
@@ -1132,6 +1344,7 @@ def _backtest(
     return {
         "ran": True,
         "scheme": "time split — the last weeks of the training frame, held out",
+        "target": target,
         "why_time_split": (
             "Adjacent weeks of one product-store share their lagged units "
             "almost exactly, so a random split scores the model on near-copies "
@@ -1141,7 +1354,7 @@ def _backtest(
         "test_weeks": [cutoff + 1, last],
         "train_rows": int(train_mask.sum()),
         "test_rows": int(test_mask.sum()),
-        **_error_summary(y_test, np.log1p(predicted["mean"])),
+        **_error_summary(y_test, predicted["mean"]),
         "interval": {
             "nominal": [min(quantiles), max(quantiles)],
             "nominal_coverage": round(max(quantiles) - min(quantiles), 4),
@@ -1154,11 +1367,18 @@ def _backtest(
     }
 
 
-def _error_summary(actual_units: np.ndarray, predicted_log1p: np.ndarray) -> dict[str, float]:
-    """Error on both scales. `predicted_log1p` is on the fitted scale."""
-    predicted_units = np.clip(np.expm1(predicted_log1p), 0.0, None)
+def _error_summary(
+    actual_units: np.ndarray, predicted_units: np.ndarray
+) -> dict[str, float]:
+    """Error on both scales, from predictions already inverted to units.
+
+    Takes units rather than the fitted scale because the fitted scale is no
+    longer one thing: `tweedie` and `poisson` predict units directly, and a
+    smearing-corrected `log1p` prediction is not `expm1` of anything.
+    """
+    predicted_units = np.clip(predicted_units, 0.0, None)
     residual = actual_units - predicted_units
-    log_residual = np.log1p(actual_units) - predicted_log1p
+    log_residual = np.log1p(actual_units) - np.log1p(predicted_units)
     return {
         "mae_units": round(float(np.mean(np.abs(residual))), 6),
         "rmse_units": round(float(np.sqrt(np.mean(residual**2))), 6),

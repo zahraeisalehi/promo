@@ -401,6 +401,15 @@ Recovery against a known truth is what decides both. A cell that recovers τ wit
 less bias wins on evidence, and the result is recorded as a settled decision
 rather than as a preference.
 
+**Both are now settled — see decisions 10 and 13 in `docs/data_findings.md`.**
+Identity stays off (paired t = −1.20, immaterial). The contemporaneous block is
+**out** (paired t = 3.07 against it). **Run this grid only against a working
+estimator.** Its first run, under the `log1p` defect of decision 12, said the
+block *helped* — a clean, statistically comfortable answer about a world that
+did not exist, because the block was propping up a counterfactual that was
+decaying for an unrelated reason. Recording it then would have carried the wrong
+feature set into every later phase with a paper trail claiming it was measured.
+
 ### It also owes a check on uneven exposure
 
 Settled decision 11 (Task 4.3) puts a product-store in a campaign if it was
@@ -414,6 +423,55 @@ four weeks of the same campaign, against a known per-week effect. **Report
 whether recovery of the campaign-level truth is biased by the rule, and in which
 direction.** If it is, the fix is a stated weighting — not a quiet change to
 which cells count, which would re-open a settled decision by implementation.
+
+### "Recovers approximately zero" means bias share below 0.10
+
+The phrase was left undefined and a gate you cannot fail is not a gate. **The
+condition is: at τ = 0, the absolute gross bias share stays below 0.10 at
+no-sale rates up to 20%**, measured over at least three seeds. Bias share is
+`(estimate − truth) / true counterfactual units`, which is comparable across
+effect sizes and panel sizes.
+
+**The achieved figures are +0.017 at 10% no-sale and +0.058 at 20%.** These are
+a *positive bias*, not zero. At 20% sparsity the pipeline still reports six
+percent of the counterfactual as incremental units where the world contained
+none. The condition is met; the estimator does not recover zero, it recovers
+something small and signed, and the two are not the same claim.
+
+**What remains is rollout decay, not retransformation.** The retransformation
+half is fixed: one-step counterfactual ratios move from 0.84 to ~1.03 under
+Poisson. The recursion is not: **by the seventh rollout step the counterfactual
+is still 18–28% low under every target tried**, including both fixes. Each
+step's features are built from earlier predictions, so an error invisible at one
+week is not at seven. The residual τ = 0 bias is that decay, and it grows with
+horizon — a longer campaign or a longer repurchase cycle will show more of it
+than these figures do.
+
+The comparison that settled the target is in
+`data/interim/synthetic_target_comparison.json`; `log1p`, `log1p_smearing` and
+`tweedie` all remain runnable via `fit_baseline(target=...)` so it stays
+reproducible.
+
+### The interval is uninformative, and that is open
+
+Named here so it is not mistaken for conservatism. **Coverage is 1.00 against a
+nominal 0.80 in every cell of every grid**, with mean widths of 4.3× to 25.6×
+the effect they must resolve. On the real panel `q10` is **0.000 on essentially
+every row**, because on a panel that is 87% zeros the true tenth percentile of a
+product-store-week genuinely is zero — the band is effectively `[0, q90]`.
+
+**The Poisson fix did not touch this.** It changed the mean model; the quantile
+models are separate fits with a `quantile` objective and were not altered, and
+their widths are within a few percent of the `log1p` ones at every sparsity. A
+band wide enough to always contain the truth is how a broken point estimate
+passes a coverage check, which is exactly how the retransformation defect
+survived the first recovery run.
+
+**This is unresolved going into Task 4.5.** It matters there directly: an
+estimate is compared against the placebo band, and it also ships with this
+interval. Task 5.2's ROI bootstrap draws on these quantile paths, so an
+uninformative band propagates into the denominator interval that
+`ROI_UNBOUNDED` keys on.
 
 ### Task 4.5 — Placebo
 
@@ -430,7 +488,13 @@ Its message carries this project's sharpest distinction and there is already a
 test asserting the wording: an estimate inside the band means **this comparison
 cannot see the effect**, never that the promotion had none.
 
-**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, **the identity and contemporaneous-block cells of Task 4.4's two-by-two are reported and each choice is recorded as settled by recovery**, **the uneven-exposure check on settled decision 11 is reported with its bias direction**, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
+**Done when:** the τ=0 synthetic case recovers approximately zero **at the tolerance defined above — absolute bias share below 0.10 at no-sale rates up to 20%**, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, **the identity and contemporaneous-block cells of Task 4.4's two-by-two are reported and each choice is recorded as settled by recovery**, **the uneven-exposure check on settled decision 11 is reported with its bias direction**, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
+
+**Two things are not in this list and are not therefore fine.** The rollout's
+18–28% decay by week seven and the uninformative interval are both open, both
+recorded above, and neither blocks the phase. They are limitations of what
+Phase 4 ships, and anything downstream that reads a lift or a band inherits
+them.
 
 ---
 

@@ -444,9 +444,12 @@ def test_a_campaign_with_no_effect_cannot_be_told_from_drift(seed: int):
     _, diag = _estimate(panel, seed=seed)
     lift, drift = diag["lift"], diag["drift_check"]
 
-    # Same order of magnitude, compared over the same number of steps.
+    # The estimate is not large next to the drift, compared over the same
+    # number of steps. Only the upper bound is a claim: a ratio far below one
+    # means drift dominates the estimate outright, which is the same finding
+    # more emphatically, not a failure of it.
     ratio = abs(lift["gross_incremental"]) / abs(drift["residual_units_first_weeks"])
-    assert 0.25 < ratio < 4.0
+    assert ratio < 4.0
 
     assert drift["exceeds_gross"] == (
         abs(drift["residual_units_first_weeks"]) >= abs(lift["gross_incremental"])

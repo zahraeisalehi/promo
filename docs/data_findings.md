@@ -346,6 +346,154 @@ the campaign-level truth is biased by the rule and in which direction. If it is,
 the fix is a stated weighting, not a quiet change to which cells count. Recorded
 in Task 4.4's section in `docs/plan.md`.
 
+**Added in Task 4.4:** two settled decisions — what the mean model is fitted on,
+and which features it may see — plus one open limitation that is not a decision
+because it is not resolved.
+
+| # | Decision | From |
+|---|---|---|
+| 12 | **The baseline is fitted with a Poisson objective on raw units, not on `log1p(units)`.** `expm1(E[log1p(y)])` understates a conditional mean with mass at zero, and the rollout compounds it. | Task 4.4 |
+| 13 | **The mediator block — `n_stores_carrying`, `category_units_ex_focal`, `store_traffic` — is excluded from the baseline.** Measured in week *w*, and moved by the promotion. | Task 4.4 |
+
+**Decision 13 depends on decision 12 and reverses what the same grid said before
+it.** The full history is below, under *Settled decision 13*; it is the clearest
+example in this project of a measurement that was correct about the wrong world.
+
+**On (12): the defect was large and it looked like a result.** Under `log1p`,
+recovering a true effect of **zero** on a panel with 10% no-sale weeks returned
+**+0.277** of counterfactual units, and **+0.444** at 20%. The pipeline reported
+a large positive lift where the world contained none. Two mechanisms compounded:
+the retransformation understated the one-step counterfactual by 17%, and the
+recursive rollout fed that understatement back as the next week's lag until the
+counterfactual was 55% low by the seventh step.
+
+Two fixes were tried, both kept runnable via `fit_baseline(target=...)`. τ = 0
+bias share, three seeds per cell:
+
+| target | 0% | 5% | 10% | 20% |
+|---|---:|---:|---:|---:|
+| `log1p` | −0.029 | 0.122 | **0.277** | **0.444** |
+| `log1p_smearing` (Duan) | −0.052 | −0.025 | 0.041 | 0.099 |
+| `tweedie` | −0.058 | −0.021 | 0.043 | 0.085 |
+| **`poisson`** | −0.050 | −0.022 | **0.017** | **0.058** |
+
+Both work. **Poisson wins by about 2× at the sparsity that matters, and the real
+panel is 87% zero rows.** Duan's smearing correction is the more conservative
+change — same fit, corrected inversion — and it is retained rather than deleted
+so the comparison stays reproducible. The correction applies to the mean only:
+quantiles are equivariant under `expm1`, so scaling them would widen the band
+for nothing.
+
+**What the fix did not fix.** One-step counterfactual ratios move from 0.84 to
+~1.03, but **by the seventh rollout step the counterfactual is still 18–28% low
+under every target tried**. The residual τ = 0 bias is compounding, not
+retransformation, and it grows with horizon. The tolerance this is measured
+against is now written down in `docs/plan.md`: absolute bias share below 0.10 at
+no-sale rates up to 20%.
+
+### Open limitation — the interval is uninformative, not conservative
+
+Not a settled decision, because nothing about it is settled. **Coverage is 1.00
+against a nominal 0.80 in every cell of every grid**, at mean widths of 4.3× to
+25.6× the effect they must resolve. On the real panel `q10` is **0.000 on
+essentially every row**: this panel is 87% zeros, so the true tenth percentile
+of a product-store-week genuinely is zero and the band is effectively
+`[0, q90]`.
+
+**Neither fix touched this.** Both changed the mean model; the quantile models
+are independently fitted with a `quantile` objective and were not altered.
+Widths under Poisson are within a few percent of the `log1p` ones at every
+sparsity — 4,602 / 5,172 / 6,463 / 7,709 against 4,469 / 5,608 / 6,634 / 7,668
+at 0, 5, 10 and 20% no-sale. Dropping the mediator block moved them only from
+7,153 to 6,829 across the two-by-two.
+
+This is how the retransformation defect survived the first recovery run: a band
+wide enough to always contain the truth passes a coverage check while the point
+estimate inside it is wrong by a quarter of the counterfactual. **Coverage of
+1.00 is a finding about the band, not a reassurance about the estimate.**
+Unresolved going into Task 4.5, where an estimate is compared against a placebo
+band and still ships with this interval, and into Task 5.2, whose ROI bootstrap
+draws on these same quantile paths.
+
+### The two-by-two, re-measured under Poisson
+
+The first run of this grid was measured under the `log1p` defect and its
+conclusions were **not** recorded, because a common ~1,670-unit offset in every
+cell can mask or invent a difference between cells. Re-run under Poisson, five
+seeds per cell, paired within `(tau, seed)`:
+
+| axis | mean paired difference in bias share (on − off) | paired t | verdict |
+|---|---:|---:|---|
+| identity | −0.0021 | −1.20 | **immaterial — confirmed** |
+| contemporaneous block | **+0.0150** | **+3.07** | **reversed: the block now hurts** |
+
+**Identity stays off**, which confirms settled decision 10 on evidence from both
+grids rather than on the argument it was recorded with.
+
+The block is settled decision 13 below.
+
+### Settled decision 13 — the mediator block is out
+
+| # | Decision | From |
+|---|---|---|
+| 13 | **`n_stores_carrying`, `category_units_ex_focal` and `store_traffic` are excluded from the baseline feature set.** They are measured in week *w* and the promotion moves them. `MEDIATOR_FEATURES` names them; `BASELINE_FEATURES` is now twelve columns. | Task 4.4 |
+
+**The evidence.** Five seeds per cell, paired within `(tau, seed)`, 40 pairs:
+
+| | with the block | without |
+|---|---:|---:|
+| bias share, all τ | 0.032 | **0.017** |
+| bias share at τ = 0 | 0.026 | **0.010** |
+| mean interval width (units) | 7,153 | 6,829 |
+
+Mean paired difference **+0.0150**, **t = 3.07**, and the block is worse in
+**68% of the 40 pairs**. Dropping it roughly halves the bias at a true effect of
+zero, which is the gate metric.
+
+**The mechanism, because it is the reason the first measurement lied.** Under
+`log1p` the same grid said the block *helped*: bias 0.299 with, 0.319 without.
+That was real, and it was a symptom. The three features are **exogenous level
+signals the recursion cannot corrupt** — unlike a lag, they do not get
+overwritten by the model's own predictions as the rollout walks forward. They
+were propping up a counterfactual that was decaying for a completely different
+reason: the `expm1` retransformation bias compounding through the recursion
+(settled decision 12). The prop was worth more than the mediator cost, so the
+block looked beneficial.
+
+Poisson removed the decay. With nothing left to prop up, what remains is the
+mediator cost Task 2.6 flagged and Task 3.2 deferred: all three are measurable
+consequences of the promotion, so conditioning on them absorbs part of the
+effect being estimated.
+
+**This is a case where the correct choice under a defective estimator was the
+wrong choice under a working one.** The sign of the answer flipped when an
+unrelated defect was fixed. Recorded in full because of what nearly happened:
+Task 4.4's brief said to settle both axes by recovery and record the result as a
+settled decision, and the first grid produced a clean, statistically comfortable
+answer. **Had the block been recorded as settled after that grid, it would have
+been carried into Phase 5, Phase 6 and the ranking layer silently** — with a
+paper trail saying it had been measured, which is worse than one saying it was
+assumed. It survived only because the τ = 0 failure forced the estimator to be
+fixed and the grid to be re-run.
+
+The general lesson, and it is not specific to this block: **a modelling choice
+measured against a biased estimator is a measurement of the bias, not of the
+choice.** Any comparison recorded before decision 12 should be treated as
+unverified until re-run — which is why the two-by-two's first run was not
+recorded, and why the report file now stamps the target it was produced under.
+
+`fit_baseline(features=(*BASELINE_FEATURES, *MEDIATOR_FEATURES))` restores the
+block, so the comparison stays runnable and this record stays checkable.
+
+### Settled decision 11 under Poisson — suggestive, not established
+
+Uneven exposure now looks slightly worse than full exposure (bias share 0.058
+against 0.035; offsets 301 against 213 units), where under `log1p` the offsets
+were indistinguishable. But the paired difference is **+0.023 with t = 2.05 over
+five seeds** — around p = 0.11, which is not a finding. **Decision 11 is neither
+confirmed nor overturned here.** Settling it needs more seeds; it is not
+recorded as settled on this evidence.
+
 ---
 
 ## Task 1.1 — Shape and coverage
@@ -2028,27 +2176,35 @@ from silent.
 
 ### The fit
 
-Fifteen features, LightGBM at `max_bin=63` / `num_leaves=63`, target
-`log1p(units)`, inverted with `expm1` and floored at zero. Three independent
-quantile fits at 0.1, 0.5, 0.9.
+**These figures are the shipped model, after decisions 12 and 13.** Task 4.1
+first shipped fifteen features on a `log1p` target; both were changed by Task
+4.4's recovery evidence and this section was rewritten rather than left to
+describe a model nobody runs.
+
+**Twelve features**, LightGBM at `max_bin=63` / `num_leaves=63`, **Poisson
+objective on raw units** — no retransformation — plus three independent quantile
+fits at 0.1, 0.5, 0.9 on the same design.
 
 | feature | gain share |
 |---|---:|
-| `units_roll_mean_13` | 46.29% |
-| `n_stores_carrying` | 30.74% |
-| `units_roll_mean_8` | 6.45% |
-| `store_traffic` | 5.96% |
-| `in_mailer` | 2.18% |
-| everything else (10 features) | 8.38% |
+| `units_roll_mean_13` | 80.6% |
+| `in_mailer` | 8.2% |
+| `units_roll_mean_8` | 2.7% |
+| `price_rel_category_lag` | 2.2% |
+| `units_roll_mean_4` | 1.3% |
+| everything else (7 features) | 5.0% |
 
-`is_holiday_week` contributes exactly zero, as it must — Task 2.6 recorded that
-this dataset has no calendar anchor, so the flag is False everywhere.
+The concentration is the point: with the mediators gone, a thirteen-week rolling
+mean of the cell's own past carries four fifths of the model. `in_mailer` at
+8.2% is settled decision 8 earning its place — it was 2.2% when three
+week-*w* features were absorbing the signal. `is_holiday_week` contributes
+exactly zero, as it must: Task 2.6 recorded that this dataset has no calendar
+anchor, so the flag is False everywhere.
 
-**Quantile crossings are measured, not sorted away**: q10 > q50 on 0.041% of
-rows and q50 > q90 on 0.323%, 0.363% either way. The three models are separate
-fits, not a decomposition of one, so crossings are possible; re-ordering them
-would make the interval look coherent while hiding that the fits disagree about
-the conditional distribution.
+**Quantile crossings are measured, not sorted away**: 0.36% of rows either way.
+The three models are separate fits, not a decomposition of one, so crossings are
+possible; re-ordering them would make the interval look coherent while hiding
+that the fits disagree about the conditional distribution.
 
 ### The backtest, and what it is not
 
@@ -2057,19 +2213,27 @@ random one: adjacent weeks of a product-store share their lagged units almost
 exactly, so a random split scores the model on near-copies of its own training
 rows.
 
-| | |
-|---|---:|
-| MAE | 0.273 units |
-| RMSE | 0.721 units |
-| bias | +0.082 units (under-predicts) |
-| mean actual / predicted | 0.239 / 0.157 |
-| [q10, q90] empirical coverage | 92.73% against a nominal 80% |
+| | log1p (first ship) | Poisson, 15 features | **Poisson, 12 features (shipped)** |
+|---|---:|---:|---:|
+| MAE | 0.273 | 0.310 | **0.333** |
+| RMSE | 0.721 | 0.708 | **0.724** |
+| bias | +0.082 | +0.001 | **−0.013** |
+| mean actual / predicted | 0.239 / 0.157 | 0.239 / 0.237 | **0.239 / 0.252** |
+| [q10, q90] coverage | 92.7% | 92.8% | **94.3%** |
+
+**MAE rose and that is the honest direction.** The `log1p` figure was lower
+*because* the model systematically under-predicted — 0.157 against an actual
+0.239 — and on a panel that is 87% zeros, predicting near-zero scores well on
+absolute error while being useless as a counterfactual. Bias is the metric that
+matters here and it went from +0.082 to −0.013. **A validation metric that
+rewards the defect is not a validation metric**, which is the same lesson as
+decision 13 in a different costume.
 
 **This is necessary and not sufficient, and must never be quoted as evidence the
 effect estimate is right.** It is error on untreated weeks; it says nothing
 about `ŷ(0)` where `D = 1`, which is the only quantity the baseline exists to
-produce. The interval over-covers, which is the safe direction but still a
-mis-calibration to carry into Task 5.2's ROI bootstrap.
+produce. Coverage of 94.3% against a nominal 80% is not conservatism — see the
+open limitation on the interval above.
 
 ### The treated group is split, not pooled
 
@@ -2083,3 +2247,49 @@ window:
 
 `mechanic_strata()` emits the label, so Tasks 4.3 and 4.5 can report a display
 effect and a joint effect rather than one number that is neither.
+
+---
+
+## Task 4.3 — what the model changes did to a real campaign
+
+Product 834117, `WATER - CARBONATED/FLVRD DRINK`, weeks 80–83, 101 cells,
+six-week horizon from the repurchase cycle. The same campaign, before and after
+decisions 12 and 13:
+
+| | log1p, 15 features | **Poisson, 12 features (shipped)** |
+|---|---:|---:|
+| observed units, campaign weeks | 61.0 | 61.0 |
+| counterfactual, campaign weeks | 46.43 | **63.98** |
+| gross incremental | +14.57 | **−2.98** |
+| post-window residual | +10.81 | **−60.89** |
+| net incremental | **+25.38** | **−63.88** |
+| retention ratio | 1.74 | **None** |
+| drift, campaign-length steps | +12.93 | **−7.95** |
+| drift, full window | +30.87 (+23.9%) | **−19.73 (−11.0%)** |
+
+The intermediate model — Poisson on fifteen features — was never measured on
+this campaign, so the two changes cannot be attributed separately from this
+table alone. The synthetic grids separate them: decision 12 moved bias share
+from 0.277 to 0.017 at 10% sparsity, decision 13 from 0.032 to 0.017 across all
+τ.
+
+**The sign flipped.** A campaign that read as +25 net incremental units now
+reads as −64. The counterfactual for the promoted weeks rose from 46.4 to 64.0
+against 61 observed units, which is the retransformation fix arriving: the old
+counterfactual was too low, so the residual was too high, exactly as decision 12
+predicts. The retention ratio is now `None` — gross is non-positive, and a
+retention share of a non-positive base is arithmetic without a meaning.
+
+**The drift check still exceeds the gross, and now in the other direction.**
+−7.95 units of drift over four campaign-length steps against a gross of −2.98,
+so `exceeds_gross` is still True and the reading is unchanged in substance:
+*this campaign's lift is not resolvable by this method at this horizon.* What
+changed is the sign of both quantities, not the verdict. Drift as a share of the
+counterfactual fell from +23.9% to −11.0%, which is a real improvement in
+magnitude and still large next to an effect of a few units.
+
+**Neither the +25 nor the −64 should be acted on**, and the second is not more
+trustworthy for being negative. The honest reading is that a 101-cell campaign
+on a product selling well under one unit per store-week does not carry enough
+signal for this method to resolve, at either model version. Task 4.5's placebo
+band is what turns that from a diagnostic into a refusal.
