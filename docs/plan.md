@@ -253,7 +253,7 @@ These are the extra variables that let the baseline generalise across campaign t
 
 ### Task 3.4 — Break-even
 
-> **Prompt:** Add `kappa_star(depth, margin)` returning depth over margin, with margin as a required user-supplied parameter. When margin is None, return None and the reason code NO_MARGIN. Add a sweep that, for a given campaign's observed depth, tabulates the required incremental share across assumed margins from 10% to 50%.
+> **Prompt:** Add `kappa_star(depth, margin)` returning depth over margin, with margin as a required user-supplied parameter. When margin is None, return None and the reason code NO_MARGIN. Add a sweep that, for a given campaign's observed depth, tabulates the required incremental share across assumed margins from 10% to 50% — on the same nine-point grid Task 5.2 defines (5-point steps), so the gate's sweep and the accounting table never disagree.
 
 Since this dataset has no COGS, that sweep *is* your MVP 03 answer, and it is an honest one: here is the margin your promotion needed to beat.
 
@@ -299,6 +299,38 @@ This is your first demoable checkpoint. If everything after this failed, you wou
 
 > **Prompt:** Write `promo/accounting.py`. Compute the subsidy — the discount paid on all units sold during the promotion, not only the incremental ones. Compute promotional profit as incremental margin minus total promotional cost, parameterised on an assumed margin. Compute ROI as a bootstrap interval from the baseline's quantile draws, returning ROI_UNBOUNDED when the denominator interval spans zero. Never average ROIs across campaigns; aggregate components and divide once.
 
+### NO_MARGIN is the condition that produces the right answer, not a gap in it
+
+`promo/io.py` establishes at ingest that no cost or margin column exists in any
+of the eight tables — it searches all 46 column names for `cogs`, `margin`,
+`cost`, `profit`, and `gross`, finds nothing, and sets the reason code
+`NO_MARGIN` (`data/interim/ingest_report.json`). Treat that as settled and final
+for this dataset.
+
+**It cannot be closed by working harder.** Margin requires the cost of goods —
+what the retailer paid its supplier. Transaction data records what the *shopper*
+paid. The two numbers sit on opposite sides of the retailer, and no amount of
+price reconstruction crosses that line: every figure recoverable from
+`SALES_VALUE`, `RETAIL_DISC`, `COUPON_DISC`, and `COUPON_MATCH_DISC` is a fact
+about the shopper-facing price, and none of them is a fact about supplier cost.
+A margin here would have to be invented. This project's whole claim is that it
+does not invent numbers, so it does not invent this one.
+
+**So the deliverable changes shape, and is better for it.** Rather than one ROI
+resting on a fabricated margin, MVP 03 ships two objects that are computable
+without any margin at all:
+
+1. **The break-even margin per campaign** — the gross margin the promotion would
+   have needed to clear its own discount.
+2. **A sensitivity table** — incremental profit across assumed margins from 10%
+   to 50%, so a reader who knows their own margin reads their answer off the
+   table.
+
+A merchant knows their margin; the dataset does not. Handing them the threshold
+and letting them apply their own number is more useful than handing them a point
+estimate built on a guess, and it is the only version of this output that is
+true. Say exactly that on stage. `NO_MARGIN` is not an apology.
+
 ### Task 5.1 — Total promotional cost has two components, not one
 
 Promotional cost is **discount subsidy plus free goods**. Both are money the
@@ -337,7 +369,62 @@ whose cost is 90% free goods is a structurally different instrument from one
 that is 90% price discount, and the recommendation in Phase 7 depends on telling
 them apart.
 
-**Done when:** every campaign has a break-even margin, a margin-sensitivity table, and either an ROI interval or a stated refusal — and total promotional cost is reported as subsidy plus free goods, with the split visible and the unpriced residual stated rather than silently zeroed.
+### Task 5.2 — Break-even margin and the sensitivity table
+
+> **Prompt:** In `promo/accounting.py`, add `breakeven_margin(campaign)` returning `m_star = promo_cost_total / incremental_revenue`, where `promo_cost_total` is the subsidy plus free goods from Task 5.1 and `incremental_revenue` is the Phase 4 incremental units valued at the promoted price. Return it as an **interval**, not a point: the numerator is known and the denominator is estimated, so propagate the lift interval through the ratio. Return `None` with reason code `ROI_UNBOUNDED` when the incremental-revenue interval spans zero — a promotion with no measurable lift has no finite break-even margin, and reporting a large one implies a precision that is not there.
+>
+> Then add `sensitivity_table(campaign)` returning incremental profit at assumed gross margins of **10%, 15%, 20%, 25%, 30%, 35%, 40%, 45%, and 50%** — nine columns, 5-point steps. Each cell is `m * incremental_revenue - promo_cost_total`, in currency, signed. Carry the lift interval into each cell so a cell whose sign is uncertain is marked as such rather than shown as a confident positive. The table is the campaign's answer; the break-even margin is where its sign flips.
+
+**Read the table, not a single number.** The nine columns exist so that the
+reader supplies the one fact the dataset cannot. A merchant on a 22% margin
+looks at the 20% and 25% columns and knows. Nothing in the pipeline needs to
+guess on their behalf, and the table makes the guess unnecessary rather than
+hidden.
+
+**The identity that ties this to Phase 3.** Task 3.4's `kappa_star(depth, margin)`
+— the incremental share a campaign needs to break even — is the same statement
+seen from the other side: `kappa_star(m) = m_star / m`. Requiring more than 100%
+of promoted units to be incremental is exactly the condition that the break-even
+margin exceeds the assumed margin. Task 3.4's sweep and this table therefore use
+the identical 10–50% grid in 5-point steps, and this task is the authority on
+that grid. The generalisation here is that `m_star` includes free goods, which a
+depth-over-margin ratio does not.
+
+**Flag any campaign whose break-even margin exceeds 50%.** No plausible grocery
+gross margin clears it, so the campaign is arithmetically unprofitable before
+any measurement question is asked — every cell in its sensitivity row is
+negative, by construction. Emit the existing `KAPPA_IMPOSSIBLE` reason code
+rather than inventing a new one: `m_star > 0.5` and `kappa_star(0.5) > 1` are
+the same sentence, by the identity above. Surface these campaigns in the
+Portfolio page as a distinct group, and feed them to Task 7.4, where a campaign
+that cannot pay at any believable margin is the cheapest stop recommendation the
+system can make — it needs no counterfactual to defend it.
+
+### Task 5.3 — A supplied margin is an assumption, and is labelled as one
+
+The system accepts a margin from the user. It never forgets where it came from.
+
+> **Prompt:** Give every accounting entry point an optional `margin` parameter and a `margin_source` field taking `None`, `"supplied"`, or `"derived"` — with `"derived"` unreachable on this dataset and present only so a future dataset carrying COGS does not need the field invented. When `margin` is None, return break-even and the sensitivity table, and return `None` with reason code `NO_MARGIN` for any figure that requires a margin. When `margin` is supplied, compute those figures and stamp every one of them — profit, ROI, ranking position, response-curve crossing, stop recommendation — with `conditional_on_margin = <value>` and `margin_source = "supplied"`. Add a test asserting that no figure computed from a supplied margin can be serialised without that stamp.
+
+Three rules follow, and none of them is optional:
+
+1. **A supplied margin never replaces the measured objects.** The break-even
+   margin and the sensitivity table still ship. They are what the data
+   establishes; the supplied figure is what the user asserted.
+2. **`promo/narrate.py` must say so in words.** A verdict resting on a supplied
+   margin reads "at the 30% margin you supplied, this campaign returned …",
+   never "this campaign returned …". The LLM receives `margin_source` in its
+   JSON and has a fixed clause for it.
+3. **The UI marks it.** Any figure carrying `conditional_on_margin` renders with
+   the assumption visible next to it, through the same shared component that
+   renders `GateResult`, so an assumption looks as deliberate as a refusal.
+
+The failure this prevents is specific and easy to walk into: a user types 30%
+into a box during the demo, and four screens later a ranked list of ROIs looks
+like a measurement. It is not one. It is arithmetic conditional on a number the
+user made up, and the system must keep saying so.
+
+**Done when:** every campaign has a break-even margin reported as an interval, a nine-column sensitivity table across 10–50% in 5-point steps, and either an ROI interval or a stated refusal; total promotional cost is reported as subsidy plus free goods, with the split visible and the unpriced residual stated rather than silently zeroed; campaigns with a break-even margin above 50% are flagged `KAPPA_IMPOSSIBLE`; and no figure derived from a supplied margin can leave the module without carrying `margin_source` and `conditional_on_margin`.
 
 ---
 
