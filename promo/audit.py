@@ -50,14 +50,21 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import numpy as np
 import pandas as pd
 
+from promo.features import CONTEMPORANEOUS_FEATURES, LAGGED_FEATURES
 from promo.io import connect
 
 __all__ = [
     "AXES",
+    "DEFAULT_COVARIATES",
+    "LEAKAGE_AUC",
     "MEANINGFUL_MIXED_SHARE",
+    "PROPENSITY_HIGH",
+    "PROPENSITY_LOW",
     "UnobservedRowsError",
+    "overlap",
     "variation_axes",
     "write_diagnostics",
 ]
@@ -77,6 +84,21 @@ AXES: dict[str, str] = {
 MEANINGFUL_MIXED_SHARE: float = 0.10
 
 _CLASSES = ("fully_treated", "fully_untreated", "mixed")
+
+#: The covariates the propensity model sees by default: exactly the Phase 2.6
+#: feature set. Identifiers are deliberately absent — a tree given PRODUCT_ID
+#: memorises which products get displayed and returns a near-perfect AUC that
+#: says nothing about confounding. Pass them explicitly if that is the question.
+DEFAULT_COVARIATES: tuple[str, ...] = (*LAGGED_FEATURES, *CONTEMPORANEOUS_FEATURES)
+
+#: Propensity outside these bounds means a row has almost no counterpart of the
+#: other kind. The plan names both figures.
+PROPENSITY_LOW: float = 0.02
+PROPENSITY_HIGH: float = 0.98
+
+#: Above this cross-validated AUC, treated and untreated are so separable that
+#: leakage is the first explanation to rule out, not the last.
+LEAKAGE_AUC: float = 0.95
 
 
 class UnobservedRowsError(Exception):
@@ -348,6 +370,308 @@ def _diagnose(
                 f"the panel."
             ),
         },
+    }
+
+
+def overlap(
+    panel: str | Path | pd.DataFrame = "data/interim/panel.parquet",
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    treatment_column: str = "treated",
+    covariates: tuple[str, ...] | list[str] | None = None,
+    n_folds: int = 5,
+    cv: str = "group",
+    n_estimators: int = 200,
+    seed: int = 0,
+    low: float = PROPENSITY_LOW,
+    high: float = PROPENSITY_HIGH,
+    leakage_auc: float = LEAKAGE_AUC,
+    require_observed: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Can a model tell treated rows from untreated ones, and if so, why?
+
+    Fits a gradient-boosted classifier for `treated` from the covariates,
+    cross-validated, and reports the out-of-fold AUC, the share of rows whose
+    propensity sits outside `[low, high]`, and every feature's importance.
+
+    **A high AUC is ambiguous, which is the point of the importance table.** It
+    can mean genuine non-overlap — treated and untreated units really are
+    different populations, and no counterfactual exists for some of them — or it
+    can mean a covariate encodes the treatment. Those need opposite responses:
+    the first is a refusal, the second is a bug. One feature carrying most of
+    the gain is the signature of the second, so the top five are reported
+    alongside the AUC rather than in a separate place.
+
+    **Folds are grouped by product-store by default.** Adjacent weeks of the same
+    product-store are near-duplicates — they share lagged units almost exactly —
+    so a random split puts near-copies of a row on both sides and inflates the
+    AUC. Grouping keeps a product-store entirely within one fold. `cv="random"`
+    is available and the gap between the two is itself diagnostic.
+
+    Args:
+        panel: the modelling panel, as a parquet path or a DataFrame.
+        con: an existing DuckDB connection; one is opened and closed if omitted.
+        treatment_column: the boolean being predicted.
+        covariates: columns the model may see. Defaults to `DEFAULT_COVARIATES`.
+        n_folds: cross-validation folds.
+        cv: `"group"` (by product-store) or `"random"` (stratified).
+        n_estimators: boosting rounds per fold. Lower trades precision for
+            time; the default takes about two and a half minutes on the full
+            panel.
+        seed: passed to the splitter and the model; no global seeding.
+        low, high: propensity bounds outside which a row has no counterpart.
+        leakage_auc: AUC above which leakage is flagged as the first suspect.
+        require_observed: as in `variation_axes`.
+
+    Returns:
+        `(importances, diagnostics)`. `importances` is every covariate ranked by
+        mean gain across folds.
+
+    Raises:
+        UnobservedRowsError: as in `variation_axes`.
+        KeyError: a requested covariate is not in the panel.
+        ValueError: `cv` is not one of the two schemes, or the treatment does
+            not vary at all, which makes a classifier meaningless.
+    """
+    import lightgbm as lgb
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+    if cv not in {"group", "random"}:
+        raise ValueError(f"cv must be 'group' or 'random', got {cv!r}")
+    names = list(DEFAULT_COVARIATES if covariates is None else covariates)
+
+    own = con is None
+    con = connect() if con is None else con
+    try:
+        frame = _load_for_overlap(
+            panel, con, treatment_column, names, require_observed
+        )
+    finally:
+        if own:
+            con.close()
+
+    y = frame["_treated"].to_numpy()
+    if y.all() or not y.any():
+        raise ValueError(
+            "the treatment does not vary in this panel, so a classifier "
+            "separating treated from untreated is meaningless"
+        )
+
+    features = frame[names]
+    groups = (
+        frame["PRODUCT_ID"].astype(str) + "_" + frame["STORE_ID"].astype(str)
+        if cv == "group"
+        else None
+    )
+    splitter = (
+        GroupKFold(n_splits=n_folds)
+        if cv == "group"
+        else StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    )
+    splits = list(
+        splitter.split(features, y, groups)
+        if cv == "group"
+        else splitter.split(features, y)
+    )
+
+    propensity = np.full(len(frame), np.nan)
+    gains = np.zeros(len(names))
+    fold_auc: list[float] = []
+    for fold, (train_idx, test_idx) in enumerate(splits):
+        model = lgb.LGBMClassifier(
+            # CLAUDE.md: max_bin 63, num_leaves no greater than 63.
+            max_bin=63,
+            num_leaves=31,
+            n_estimators=n_estimators,
+            learning_rate=0.05,
+            random_state=seed + fold,
+            n_jobs=2,
+            verbose=-1,
+        )
+        model.fit(features.iloc[train_idx], y[train_idx])
+        propensity[test_idx] = model.predict_proba(features.iloc[test_idx])[:, 1]
+        gains += model.booster_.feature_importance(importance_type="gain")
+        fold_auc.append(
+            float(roc_auc_score(y[test_idx], propensity[test_idx]))
+            if len(set(y[test_idx])) > 1
+            else float("nan")
+        )
+
+    importances = (
+        pd.DataFrame({"feature": names, "gain": gains})
+        .assign(gain_share=lambda d: d["gain"] / d["gain"].sum())
+        .sort_values("gain", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    diagnostics = _diagnose_overlap(
+        frame=frame,
+        y=y,
+        propensity=propensity,
+        fold_auc=fold_auc,
+        importances=importances,
+        names=names,
+        treatment_column=treatment_column,
+        cv=cv,
+        n_folds=n_folds,
+        n_estimators=n_estimators,
+        seed=seed,
+        low=low,
+        high=high,
+        leakage_auc=leakage_auc,
+        auc=float(roc_auc_score(y, propensity)),
+    )
+    return importances, diagnostics
+
+
+def _load_for_overlap(
+    panel: str | Path | pd.DataFrame,
+    con: duckdb.DuckDBPyConnection,
+    treatment_column: str,
+    names: list[str],
+    require_observed: bool,
+) -> pd.DataFrame:
+    wanted = ["PRODUCT_ID", "STORE_ID", "WEEK_NO", treatment_column, *names]
+    if isinstance(panel, pd.DataFrame):
+        missing = [c for c in wanted if c not in panel.columns]
+        if missing:
+            raise KeyError(f"not columns of the panel: {missing}")
+        frame = panel[
+            [*wanted, *(["treatment_observed"] if "treatment_observed" in panel else [])]
+        ].copy()
+    else:
+        source = f"read_parquet('{Path(panel).as_posix()}')"
+        available = {
+            r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+        }
+        missing = [c for c in wanted if c not in available]
+        if missing:
+            raise KeyError(f"not columns of the panel: {missing}")
+        if "treatment_observed" in available:
+            wanted.append("treatment_observed")
+        frame = con.execute(f"SELECT {', '.join(wanted)} FROM {source}").df()
+
+    if require_observed and "treatment_observed" in frame.columns:
+        unobserved = int((~frame["treatment_observed"].astype(bool)).sum())
+        if unobserved:
+            raise UnobservedRowsError(
+                f"{unobserved:,} rows have treatment_observed = False. Fitting a "
+                f"propensity model on them treats unobserved as untreated."
+            )
+
+    frame["_treated"] = frame[treatment_column].astype(bool)
+    return frame
+
+
+def _diagnose_overlap(
+    *,
+    frame: pd.DataFrame,
+    y: np.ndarray,
+    propensity: np.ndarray,
+    fold_auc: list[float],
+    importances: pd.DataFrame,
+    names: list[str],
+    treatment_column: str,
+    cv: str,
+    n_folds: int,
+    n_estimators: int,
+    seed: int,
+    low: float,
+    high: float,
+    leakage_auc: float,
+    auc: float,
+) -> dict[str, Any]:
+    below = propensity < low
+    above = propensity > high
+    extreme = below | above
+    top = importances.head(5)
+    top_share = float(importances.iloc[0]["gain_share"]) if len(importances) else 0.0
+
+    # A high AUC has two incompatible explanations and they need opposite
+    # responses, so the diagnosis names which one the evidence points to rather
+    # than reporting a number and leaving the reader to guess.
+    if auc >= leakage_auc:
+        diagnosis = (
+            "LEAKAGE_SUSPECTED" if top_share >= 0.5 else "NON_OVERLAP_SUSPECTED"
+        )
+    elif auc >= 0.7:
+        diagnosis = "SEPARABLE_BUT_PLAUSIBLE"
+    else:
+        diagnosis = "WELL_OVERLAPPED"
+
+    constant = [c for c in names if frame[c].nunique(dropna=False) <= 1]
+
+    return {
+        "stage": "overlap",
+        "treatment_column": treatment_column,
+        "model": {
+            "estimator": "LGBMClassifier",
+            "max_bin": 63,
+            "num_leaves": 31,
+            "n_estimators": n_estimators,
+            "learning_rate": 0.05,
+            "seed": seed,
+        },
+        "cv": {
+            "scheme": cv,
+            "folds": n_folds,
+            "grouped_by": "PRODUCT_ID x STORE_ID" if cv == "group" else None,
+            "why": (
+                "Adjacent weeks of one product-store share their lagged units "
+                "almost exactly. A random split puts near-copies on both sides "
+                "and inflates the AUC; grouping keeps a product-store whole."
+            ),
+        },
+        "rows": len(frame),
+        "treated_rows": int(y.sum()),
+        "treated_share": round(float(y.mean()), 6),
+        "auc": round(auc, 6),
+        "auc_by_fold": [round(a, 6) for a in fold_auc],
+        "propensity_extremes": {
+            "low": low,
+            "high": high,
+            "below_low": int(below.sum()),
+            "below_low_share": round(float(below.mean()), 6),
+            "above_high": int(above.sum()),
+            "above_high_share": round(float(above.mean()), 6),
+            "outside_share": round(float(extreme.mean()), 6),
+            # Which side loses its counterpart matters: a treated row with no
+            # untreated match cannot be estimated, an untreated row with no
+            # treated match is simply an unused control.
+            "treated_below_low": int((below & y).sum()),
+            "untreated_above_high": int((above & ~y).sum()),
+            "caveat": (
+                f"These shares depend on the model as well as on the data. "
+                f"{n_estimators} rounds at learning rate 0.05 shrink the logit "
+                f"towards the base rate, so a longer or less regularised fit "
+                f"would push more mass past both bounds even on identical "
+                f"data. Read the count as a lower bound on how much of the "
+                f"panel lacks a counterpart, and compare it across runs only "
+                f"at fixed hyperparameters."
+            ),
+        },
+        "covariates": names,
+        "constant_covariates": constant,
+        "top_features": [
+            {"feature": r["feature"], "gain_share": round(float(r["gain_share"]), 6)}
+            for _, r in top.iterrows()
+        ],
+        "top_feature_gain_share": round(top_share, 6),
+        "diagnosis": diagnosis,
+        "reading": (
+            "A high AUC is ambiguous. Genuine non-overlap means treated and "
+            "untreated are different populations and some rows have no "
+            "counterfactual — a refusal. A leaked covariate means a feature "
+            "encodes the treatment — a bug. One feature carrying most of the "
+            "gain points to the second; gain spread across many points to the "
+            "first."
+        ),
+        "identifiers_excluded": (
+            "PRODUCT_ID, STORE_ID and WEEK_NO are not covariates by default. A "
+            "tree given them memorises which products are displayed and returns "
+            "a near-perfect AUC that says nothing about confounding."
+        ),
     }
 
 

@@ -1439,3 +1439,82 @@ and mailer 2.28%. **This module cannot separate the two treatments and must not
 be cited as if it could.** It reports the necessary condition; Task 3.2's overlap
 check is the one with teeth. The limitation is carried in the diagnostics under
 `limitation`, not only in the source, and is asserted by a test.
+
+---
+
+## Task 3.2 — Overlap
+
+Reproduce: `promo.audit.overlap()`; results in
+`data/interim/overlap_diagnostics.json` and `overlap_importances.parquet`.
+
+**Cross-validated AUC 0.7036**, folds 0.7025–0.7049 — a spread of 0.0024, so the
+split is not driving it. Treated and untreated are distinguishable but far from
+separable. **Diagnosis: `SEPARABLE_BUT_PLAUSIBLE`.**
+
+### Not leakage, and the importance table is how we know
+
+| feature | gain share |
+|---|---:|
+| `n_stores_carrying` | 45.06% |
+| `category_units_ex_focal` | 20.19% |
+| `store_traffic` | 12.25% |
+| `price_rel_category` | 8.81% |
+| `week_of_year` | 4.23% |
+| everything else (9 features) | 9.46% |
+
+No single feature carries a majority, and the AUC is nowhere near the 0.95 bar.
+A leaked covariate looks different: AUC above 0.99 with one feature taking most
+of the gain. The synthetic version of that failure is asserted in the tests, so
+the diagnosis is calibrated against a known-leaking panel rather than asserted.
+
+**The top three are all contemporaneous, and Task 2.6 flagged exactly them.**
+`n_stores_carrying`, `category_units_ex_focal` and `store_traffic` together
+carry 77.5% of the gain, and all three are measured in week *w*. Task 2.6's
+mediator warning applies directly: they are not future information, but they can
+be *affected by* the promotion, so part of what the classifier is learning may
+be the treatment's own consequences rather than its causes. The lagged features
+contribute almost nothing by comparison — 6.1% between the seven of them. Phase 4
+should fit with and without the contemporaneous block and report both.
+
+### Overlap is one-sided, and the good side is the one that matters
+
+| | rows | share |
+|---|---:|---:|
+| propensity < 0.02 | 177,977 | **6.00%** |
+| propensity > 0.98 | **0** | **0.00%** |
+| treated rows below 0.02 | 560 | |
+| untreated rows above 0.98 | 0 | |
+
+**No region of the panel is treatment-saturated.** Nothing sits above 0.98, so
+there is no treated row whose covariates make an untreated comparison
+impossible — the direction that would force a refusal. The 6% below 0.02 are
+overwhelmingly untreated rows in regions where display is rare; they are
+unused controls, not a broken comparison. The 560 treated rows below 0.02 are
+the genuinely awkward ones: treated units in territory where treatment almost
+never happens.
+
+### The extreme share is a property of the model as well as the data
+
+30 boosting rounds at learning rate 0.05 shrink every probability towards the
+base rate. On a synthetic panel with a covariate that *is* the treatment — AUC
+above 0.99, perfect separation — a short fit reports **zero** rows outside the
+bounds and a 300-round fit reports over 90%. Same data, opposite readings.
+
+The reported figures use 200 rounds at 0.05, recorded in the diagnostics
+alongside the count. **Read 6.00% as a lower bound**, and compare it across runs
+only at fixed hyperparameters. This is asserted by a test rather than left as a
+footnote.
+
+### Two choices that shape the number, both recorded
+
+- **Folds are grouped by product-store.** Adjacent weeks of one product-store
+  share their lagged units almost exactly; a random split puts near-copies on
+  both sides and inflates the AUC. `cv="random"` is available for comparison.
+- **Identifiers are not covariates.** A tree given `PRODUCT_ID` memorises which
+  products are displayed and returns a near-perfect AUC that says nothing about
+  confounding. They can be passed explicitly when that is the question.
+
+The `seed` parameter is inert under `cv="group"`: `GroupKFold` does not shuffle
+and the learner has no stochastic component at these settings. It bites only
+under `cv="random"`. Pinned by a test so a seed sweep is not mistaken for a
+robustness check.
