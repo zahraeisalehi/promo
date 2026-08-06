@@ -11,10 +11,16 @@ fi
 
 case "$path" in
   */promo/baseline.py|*/promo/transfer.py|*/promo/validate.py|*/promo/prices.py)
-    tests=$(pytest -q tests/test_invariants.py 2>&1 | tail -5)
-    out="${out}
+    # Skip silently when the suite does not exist yet. Reporting "file not
+    # found" on every edit to a core module trains the reader to ignore this
+    # hook's output, which is the one thing it cannot afford.
+    invariants="${CLAUDE_PROJECT_DIR:-.}/tests/test_invariants.py"
+    if [[ -f "$invariants" ]]; then
+      tests=$(pytest -q "$invariants" 2>&1 | tail -5)
+      out="${out}
 Invariant tests:
 ${tests}"
+    fi
     ;;
 esac
 

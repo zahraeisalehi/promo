@@ -195,6 +195,107 @@ True is holding an interaction fixed, not removing it. Those rows must be
 effect". Adding the covariate fixes the control group; it does not purify the
 treated group.
 
+**Added in Task 4.1:** two more settled decisions, both about what the baseline
+is allowed to see.
+
+| # | Decision | From |
+|---|---|---|
+| 9 | **`price_rel_category` may never be a model feature, because its missingness *is* the outcome.** The baseline uses `price_rel_category_lag` instead, and `missingness_coupling()` checks every feature for the same shape. | Task 4.1 |
+| 10 | **Identity — `PRODUCT_ID`, `STORE_ID`, `COMMODITY_DESC` — is off by default in the baseline.** A default, not a prohibition: `include_identity=True` turns it on, and Task 4.4 must settle it by evidence. | Task 4.1 |
+
+**On (9): the column is observed if and only if the product sold.** Measured on
+the real panel over the control rows in weeks 18–101:
+
+| | |
+|---|---:|
+| training rows | 2,351,749 |
+| `price_rel_category` null | 2,046,518 |
+| `units == 0` | 2,046,518 |
+| null **and** zero | **2,046,518** |
+| null and `units > 0` | **0** |
+| priced and `units == 0` | **0** |
+
+`P(units = 0 | price null) = 1.0000` and `P(price null | units = 0) = 1.0000`,
+with no exception in either direction. The ratio needs an observed price and a
+week with no sale has none, so the column's *absence* reports the outcome. The
+first fit of `promo/baseline.py` gave it **94.3% of the gain**: the model was
+not predicting demand, it was reading zeros off a null.
+
+**What it cost to stop reading the answer.** Held-out error on weeks 94–101,
+225,038 rows, same split both times:
+
+| | MAE (units) | RMSE (units) |
+|---|---:|---:|
+| with `price_rel_category` (leaking) | **0.100** | 0.494 |
+| with `price_rel_category_lag` | **0.273** | 0.721 |
+
+**The better number was the leaking one**, and it was better precisely because
+it was leaking. Anyone comparing baseline error across this commit will see a
+2.7× regression; it is the price of an estimate that is about demand rather
+than about which rows happened to sell. Recorded here so the improvement is
+never "restored".
+
+**Why the Phase 2 leakage certificate could not catch it.**
+`test_no_feature_uses_data_from_a_later_week` rebuilds the panel with every
+value after week W perturbed and requires that no column differ at weeks ≤ W.
+That is a strong test of the right thing — **temporal** leakage, in feature
+*values*. This leak is neither: it is contemporaneous, within week *w*, and it
+lives in the *missingness pattern* rather than in any value. Perturbing later
+weeks leaves the null pattern of earlier weeks untouched, so the certificate
+passes on a panel carrying a perfect outcome readout. The two checks are
+complements, not substitutes, and neither replaces the other.
+
+**The replacement.** `add_price_history()` derives `price_rel_category_lag` —
+the last ratio observed **strictly before** week *w*, within product-store,
+computed over the whole panel *before* any row filter, so that "the previous
+week" cannot quietly become "the previous unpromoted week". It is still a
+*regular* price ratio, never a paid price, so it does not encode the deal. The
+coupling drops to `P(units = 0 | null) = 0.9586` and `P(null | units = 0) =
+0.1572` — it is null where the pair has no priced history yet, which is past
+information of the same class as `units_lag_1`.
+
+**`missingness_coupling()` is the general check, and it replaces
+blocklisting.** A named list of forbidden columns only ever catches the leak
+someone already found. The check measures, for every feature with nulls, both
+`P(units = 0 | feature null)` and `P(feature null | units = 0)`, and raises
+`OutcomeLeakError` when both exceed 0.99. Both directions are required, so a
+merely rare null cannot trip it. A test smuggles the leaking column in under a
+name the blocklist does not know, which is how we know the *measurement* is
+what fires. `price_rel_category` stays on the forbidden list as well, but the
+list is now the second line of defence rather than the only one.
+
+**Recorded and not repaired:** `n_stores_carrying` counts stores with a sale of
+the product that week **including the focal store**, so a selling row adds one
+to its own feature. It is not deterministic, so the check does not fire, but it
+is a partial use of the current week's outcome and it is now the second-largest
+gain in the fit at 30.7%. The fix belongs in Phase 2.6, which builds the column.
+
+**On (10): identity is a default, not a prohibition.** Task 3.2 already excluded
+identifiers from the overlap classifier, for a reason that transfers directly:
+*a tree given `PRODUCT_ID` memorises which products get promoted rather than
+learning why*. The baseline has the same exposure in a different shape —
+identity lets the model fit each product's level directly instead of learning
+demand structure, and a counterfactual that has memorised a product's mean is
+not a model of its demand. The lags and rolling means already carry
+product-level persistence, so the level is available without the identifier;
+`units_roll_mean_13` takes 46.3% of the gain in the shipped fit.
+
+**It is a default because the argument is not decisive.** Identity may well fit
+better on a 300-product scope, and "better fit" is not the same as "better
+counterfactual" — which is exactly the kind of claim that should be settled by
+measurement. `fit_baseline(include_identity=True)` turns it on and the
+diagnostics record which set was used, so the comparison is a parameter change
+rather than an edit.
+
+**Task 4.4 owes the evidence, on both open axes.** The synthetic-truth harness
+must report bias and interval coverage **with and without identity**, and **with
+and without the contemporaneous block** — the second axis being the one Task 3.2
+already asked for, where `n_stores_carrying`, `category_units_ex_focal` and
+`store_traffic` carry 77.5% of the classifier's gain and are all measurable
+consequences of the promotion. Two modelling choices, four cells, settled by
+recovery against a known truth rather than by argument. The obligation is
+written into Task 4.4's **Done when** in `docs/plan.md`.
+
 ---
 
 ## Task 1.1 — Shape and coverage
@@ -1846,3 +1947,89 @@ one is a data problem that implies nothing about the promotion.
 `docs/plan.md` against **Task 4.5** and **Task 5.2**, in each task's **Done
 when**, so each phase gate checks that the code fires through `run_audit()`
 rather than only that the detection exists.
+
+---
+
+## Task 4.1 — The baseline, and the leak that changed its feature set
+
+Reproduce: `promo.baseline.fit_baseline()`; boosters in `data/interim/baseline/`
+and diagnostics in `data/interim/baseline_diagnostics.json`. Settled decisions
+**9** and **10** above were both argued from this run; this section is the
+record of the fit itself.
+
+### The training frame, and what each exclusion cost
+
+| | rows | units | sales value |
+|---|---:|---:|---:|
+| panel | 2,966,328 | | |
+| − treated rows | −366,346 | −148,153 | −$217,440.07 |
+| − weeks outside 18–101 (decision 5) | −248,233 | −41,052 | −$68,325.23 |
+| **fitted on** | **2,351,749** | 545,252 | $920,602.93 |
+
+86.99% of the training rows have zero units — the explicit demand zeros Phase
+2.6 built inside the scope, kept because dropping them would refit the model on
+"weeks the product happened to sell". **13.07% carry a mailer**, which
+recomputes decision 8's 13.06% from the shipped panel rather than quoting it.
+
+A caller-supplied frame containing treated rows raises `TreatedRowsError` and is
+never filtered. Reading from the parquet, the selection happens in SQL and is
+counted in the table above — explicit and recorded, which is a different thing
+from silent.
+
+### The fit
+
+Fifteen features, LightGBM at `max_bin=63` / `num_leaves=63`, target
+`log1p(units)`, inverted with `expm1` and floored at zero. Three independent
+quantile fits at 0.1, 0.5, 0.9.
+
+| feature | gain share |
+|---|---:|
+| `units_roll_mean_13` | 46.29% |
+| `n_stores_carrying` | 30.74% |
+| `units_roll_mean_8` | 6.45% |
+| `store_traffic` | 5.96% |
+| `in_mailer` | 2.18% |
+| everything else (10 features) | 8.38% |
+
+`is_holiday_week` contributes exactly zero, as it must — Task 2.6 recorded that
+this dataset has no calendar anchor, so the flag is False everywhere.
+
+**Quantile crossings are measured, not sorted away**: q10 > q50 on 0.041% of
+rows and q50 > q90 on 0.323%, 0.363% either way. The three models are separate
+fits, not a decomposition of one, so crossings are possible; re-ordering them
+would make the interval look coherent while hiding that the fits disagree about
+the conditional distribution.
+
+### The backtest, and what it is not
+
+Weeks 94–101 held out, 225,038 rows, trained on weeks 18–93. A time split, not a
+random one: adjacent weeks of a product-store share their lagged units almost
+exactly, so a random split scores the model on near-copies of its own training
+rows.
+
+| | |
+|---|---:|
+| MAE | 0.273 units |
+| RMSE | 0.721 units |
+| bias | +0.082 units (under-predicts) |
+| mean actual / predicted | 0.239 / 0.157 |
+| [q10, q90] empirical coverage | 92.73% against a nominal 80% |
+
+**This is necessary and not sufficient, and must never be quoted as evidence the
+effect estimate is right.** It is error on untreated weeks; it says nothing
+about `ŷ(0)` where `D = 1`, which is the only quantity the baseline exists to
+produce. The interval over-covers, which is the safe direction but still a
+mis-calibration to carry into Task 5.2's ROI bootstrap.
+
+### The treated group is split, not pooled
+
+Decision 8 requires the two mechanics be reported apart. Over the estimation
+window:
+
+| stratum | rows | share | units |
+|---|---:|---:|---:|
+| `display_only` | 198,191 | 60.51% | 63,481 |
+| `display_and_mailer` | 129,324 | **39.49%** | 72,603 |
+
+`mechanic_strata()` emits the label, so Tasks 4.3 and 4.5 can report a display
+effect and a joint effect rather than one number that is neither.

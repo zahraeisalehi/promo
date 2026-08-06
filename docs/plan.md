@@ -373,6 +373,34 @@ and should be read alongside it.
 
 > **Prompt:** Write `tests/synthetic.py` generating panels with a known effect using multiplicative seasonality and AR(1) noise — deliberately not a tree-shaped process. Run the full pipeline across true effects of 0, 0.05, 0.15, 0.30 and report bias and interval coverage.
 
+### This task settles two open modelling choices, and owes both
+
+Neither can be settled by argument, and both are currently defaults chosen on
+reasoning rather than on measurement. **Report bias and interval coverage for
+every cell of the two-by-two, at each true effect:**
+
+| axis | off (the current default) | on |
+|---|---|---|
+| **identity** — `PRODUCT_ID`, `STORE_ID`, `COMMODITY_DESC` | `include_identity=False` | `include_identity=True` |
+| **the contemporaneous block** — `n_stores_carrying`, `category_units_ex_focal`, `store_traffic` | features minus the three | the full set |
+
+**Identity** is settled decision 10 (`docs/data_findings.md`, from Task 4.1).
+Task 3.2 kept identifiers out of the overlap classifier because a tree given
+`PRODUCT_ID` memorises which products get promoted rather than learning why; in
+the baseline the same exposure lets the model fit each product's level directly
+instead of learning demand structure. The lags already carry that persistence.
+Plausible either way — which is the point.
+
+**The contemporaneous block** is the question Task 3.2 raised and deferred:
+those three features carry **77.5%** of the classifier's gain, all three are
+measured in week *w*, and all three can be *affected by* the promotion. Task
+2.6's mediator warning names them. Conditioning on a mediator absorbs part of
+the effect, so the with-and-without gap is itself the diagnostic.
+
+Recovery against a known truth is what decides both. A cell that recovers τ with
+less bias wins on evidence, and the result is recorded as a settled decision
+rather than as a preference.
+
 ### Task 4.5 — Placebo
 
 > **Prompt:** Write `promo/validate.py` with a placebo harness over at least 300 never-treated windows. Return the distribution and a helper that flags whether a given estimate falls inside it.
@@ -388,7 +416,7 @@ Its message carries this project's sharpest distinction and there is already a
 test asserting the wording: an estimate inside the band means **this comparison
 cannot see the effect**, never that the promotion had none.
 
-**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
+**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, **the identity and contemporaneous-block cells of Task 4.4's two-by-two are reported and each choice is recorded as settled by recovery**, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
 
 ---
 
