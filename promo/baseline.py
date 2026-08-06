@@ -75,8 +75,10 @@ __all__ = [
     "IDENTITY_FEATURES",
     "MISSINGNESS_LEAK_THRESHOLD",
     "QUANTILES",
+    "RECURSIVE_FEATURES",
     "BaselineModel",
     "ForbiddenFeatureError",
+    "NonContiguousWeeksError",
     "OutcomeLeakError",
     "TreatedRowsError",
     "add_price_history",
@@ -84,6 +86,7 @@ __all__ = [
     "fit_baseline",
     "mechanic_strata",
     "missingness_coupling",
+    "rollout",
     "write_diagnostics",
 ]
 
@@ -234,6 +237,33 @@ def add_price_history(
         con.unregister("_price_history_frame")
         if own:
             con.close()
+
+
+#: Features the rollout recomputes at every step from the counterfactual series
+#: rather than reading. Exactly the Phase 2.6 lagged block: every one of them is
+#: a function of past units, and inside a counterfactual window "past units"
+#: means the counterfactual's own path.
+RECURSIVE_FEATURES: tuple[str, ...] = LAGGED_FEATURES
+
+
+#: Features the rollout holds at their last pre-window value **even when the
+#: caller supplies them in `exog_weeks`**. `price_rel_category_lag` is here
+#: because its in-window value depends on whether the product sold, and whether
+#: it sold is what the counterfactual exists to say — settled decision 9. The
+#: natural way to call `rollout` is to hand it a slice of the panel, which
+#: carries the observed column; without this the risky path would be the
+#: default and nothing would say so. Pass `carry=()` to opt out deliberately.
+CARRIED_BY_DEFAULT: tuple[str, ...] = ("price_rel_category_lag",)
+
+
+class NonContiguousWeeksError(Exception):
+    """The rollout weeks do not continue the history week by week.
+
+    Raised rather than patched. A lag is defined by arithmetic on `WEEK_NO`, so
+    a gap silently turns `units_lag_1` into "the last week we happened to have",
+    which is a different variable in every row — the same failure Phase 2.6
+    built explicit zeros to avoid.
+    """
 
 
 def missingness_coupling(
@@ -1138,6 +1168,301 @@ def _error_summary(actual_units: np.ndarray, predicted_log1p: np.ndarray) -> dic
         "mean_actual_units": round(float(np.mean(actual_units)), 6),
         "mean_predicted_units": round(float(np.mean(predicted_units)), 6),
     }
+
+
+def rollout(
+    model: BaselineModel,
+    history: pd.DataFrame,
+    exog_weeks: pd.DataFrame,
+    *,
+    quantile: float | None = None,
+    feedback: str = "recursive",
+    carry: tuple[str, ...] = CARRIED_BY_DEFAULT,
+    outcome: str = "units",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """A multi-week counterfactual whose own predictions become its lags.
+
+    For any window longer than one week the baseline needs last week's units to
+    predict this week's, and inside the window last week's *observed* units are
+    contaminated by the promotion. Feeding them in makes the counterfactual
+    chase the bump: the model is told demand was high, so it predicts high, so
+    the residual shrinks. The measured effect then falls the longer the campaign
+    runs, which is the opposite of the truth for a campaign that kept working.
+
+    Each step therefore predicts, then pushes **its own prediction** into the
+    series that the next step's lags and rolling means are computed from.
+    Nothing observed inside the window ever reaches a feature.
+
+    This is not circular. Every parameter was fitted on unpromoted weeks; the
+    rollout only applies what was learned. The honest cost is compounding error
+    down the horizon, which is what Task 4.4's synthetic truth and Task 4.5's
+    placebo band exist to measure.
+
+    Features split three ways, and the split is reported rather than assumed:
+
+    - **recursive** — `RECURSIVE_FEATURES`, recomputed each step from the
+      counterfactual path, seeded by the observed history before the window;
+    - **exogenous** — supplied per week in `exog_weeks`, which is how
+      `in_mailer` takes its **observed** value: the question is what the row
+      would have done with the mailer that actually ran and without the display;
+    - **carried** — everything else, held at its last pre-window value, plus
+      anything named in `carry` even when `exog_weeks` supplies it.
+      `price_rel_category_lag` is in `carry` by default on purpose. Its
+      in-window value depends on whether the product sold, and whether it sold
+      is exactly what the counterfactual is trying to say — settled decision 9.
+      The natural call passes a slice of the panel, which carries the observed
+      column, so the safe reading has to be the default rather than something
+      the caller remembers. `carry=()` opts out, and the diagnostics record it.
+
+    Args:
+        model: a fitted `BaselineModel`.
+        history: observed rows before the window, for one or many product-stores.
+            Must carry `PRODUCT_ID`, `STORE_ID`, `WEEK_NO`, the outcome column,
+            and every carried feature. Deep enough to seed the longest lag —
+            52 weeks for the default feature set, less if the fit is shorter.
+        exog_weeks: one row per counterfactual week per product-store, carrying
+            the keys, `WEEK_NO`, and the exogenous features. Windows may be
+            ragged across keys.
+        quantile: predict this quantile's path instead of the mean. Each
+            quantile is its own recursion — it feeds its own predictions back.
+        feedback: `"recursive"` (the estimator) or `"observed"` (the naive
+            version, which feeds observed units back). **`"observed"` is biased
+            by construction and exists to make that bias measurable** — see
+            `tests/test_rollout_contamination.py`. It is labelled in the
+            diagnostics and must never produce a reported estimate.
+        outcome: the units column, read from `history` and — under
+            `feedback="observed"` only — from `exog_weeks`.
+
+    Returns:
+        `(path, diagnostics)`. `path` has one row per key-week with
+        `counterfactual_units` and **every feature value the model was given**,
+        so a contaminated lag or a carried price is visible in the output rather
+        than inferred from the code.
+
+    Raises:
+        NonContiguousWeeksError: the window does not continue the history week
+            by week.
+        KeyError: a feature is neither recursive, nor in `exog_weeks`, nor in
+            `history`.
+        ValueError: `feedback` is not one of the two modes.
+    """
+    if feedback not in {"recursive", "observed"}:
+        raise ValueError(
+            f"feedback must be 'recursive' or 'observed', got {feedback!r}"
+        )
+    keys = ["PRODUCT_ID", "STORE_ID"]
+    for name, frame in (("history", history), ("exog_weeks", exog_weeks)):
+        missing = [c for c in (*keys, "WEEK_NO") if c not in frame.columns]
+        if missing:
+            raise KeyError(f"{name} is missing {missing}")
+    if outcome not in history.columns:
+        raise KeyError(f"history is missing the outcome column {outcome!r}")
+    if feedback == "observed" and outcome not in exog_weeks.columns:
+        raise KeyError(
+            f"feedback='observed' feeds observed units back as lags, so "
+            f"exog_weeks must carry {outcome!r}"
+        )
+
+    recursive = [c for c in model.features if c in RECURSIVE_FEATURES]
+    exogenous = [
+        c
+        for c in model.features
+        if c not in recursive and c not in carry and c in exog_weeks.columns
+    ]
+    carried = [c for c in model.features if c not in recursive and c not in exogenous]
+    absent = [c for c in carried if c not in history.columns]
+    if absent:
+        raise KeyError(
+            f"{absent} are neither recursive nor in exog_weeks, so they would be "
+            f"carried from history — but history does not have them either"
+        )
+
+    state = _rollout_state(history, exog_weeks, keys, outcome, carried)
+    steps = max((len(s["weeks"]) for s in state.values()), default=0)
+
+    rows: list[dict[str, Any]] = []
+    for step in range(steps):
+        # One predict per step across every key, so the loop is over weeks and
+        # not over rows. It cannot be vectorised away entirely: step t's
+        # features are a function of step t-1's prediction, which is what the
+        # whole function is about.
+        live = [k for k, s in state.items() if step < len(s["weeks"])]
+        if not live:
+            break
+        frame = pd.DataFrame(
+            [_rollout_row(state[k], step, recursive, exogenous, carried) for k in live]
+        )
+        predicted = model.predict(frame, quantile)
+        for key, row_index, value in zip(live, range(len(live)), predicted, strict=True):
+            s = state[key]
+            week = s["weeks"][step]
+            fed = float(s["observed"][step]) if feedback == "observed" else float(value)
+            s["series"][week] = fed
+            rows.append(
+                {
+                    # Every feature the model was actually given, not only the
+                    # recursive ones: a counterfactual nobody can audit is a
+                    # number without a derivation. The keys are written after,
+                    # so an identity feature cannot shadow them.
+                    **frame.iloc[row_index].to_dict(),
+                    "PRODUCT_ID": key[0],
+                    "STORE_ID": key[1],
+                    "WEEK_NO": week,
+                    "step": step,
+                    "counterfactual_units": float(value),
+                    "fed_back": fed,
+                }
+            )
+
+    path = (
+        pd.DataFrame(rows).sort_values([*keys, "WEEK_NO"]).reset_index(drop=True)
+        if rows
+        else pd.DataFrame(
+            columns=[*keys, "WEEK_NO", "step", "counterfactual_units", "fed_back"]
+        )
+    )
+
+    diagnostics = {
+        "stage": "rollout",
+        "feedback": feedback,
+        "quantile": quantile,
+        "keys": len(state),
+        "steps": steps,
+        "rows": len(path),
+        "features": {
+            "recursive": recursive,
+            "exogenous": exogenous,
+            "carried": carried,
+            "forced_carry": [c for c in carry if c in carried],
+            "forced_carry_overrode_exog": [
+                c for c in carry if c in carried and c in exog_weeks.columns
+            ],
+        },
+        "why_recursive": (
+            "Inside the window, last week's observed units carry the promotion. "
+            "Feeding them in makes the counterfactual chase the bump and the "
+            "measured effect shrink as the window grows. Each step feeds its "
+            "own prediction back instead, so nothing observed inside the window "
+            "reaches a feature."
+        ),
+        "carried_note": (
+            "Carried features hold their last pre-window value. "
+            "price_rel_category_lag is carried by default, and stays carried "
+            "even when exog_weeks supplies it, because its in-window value "
+            "depends on whether the product sold — which is the quantity the "
+            "counterfactual exists to state, settled decision 9. "
+            "forced_carry_overrode_exog names the columns where that happened. "
+            "Pass carry=() to use the observed path instead."
+        ),
+        "exogenous_note": (
+            "in_mailer takes its observed value here by design: the question is "
+            "what the row would have done with the mailer that actually ran and "
+            "without the display. The contemporaneous block "
+            "(n_stores_carrying, category_units_ex_focal, store_traffic) can be "
+            "affected by the promotion, so supplying its observed values "
+            "conditions the counterfactual on a mediator. Task 4.4 reports "
+            "recovery with and without that block."
+        ),
+        "compounding": (
+            "Error compounds down the horizon because each step's features are "
+            "built from earlier predictions. That is the honest cost of not "
+            "contaminating the lags, and it is what the synthetic-truth and "
+            "placebo harnesses measure."
+        ),
+    }
+    if feedback == "observed":
+        diagnostics["biased"] = True
+        diagnostics["why_biased"] = (
+            "feedback='observed' feeds the observed, promotion-contaminated "
+            "units back as lags. It exists so the contamination can be measured "
+            "against the recursive path and must never produce a reported "
+            "estimate."
+        )
+    return path, diagnostics
+
+
+def _rollout_state(
+    history: pd.DataFrame,
+    exog_weeks: pd.DataFrame,
+    keys: list[str],
+    outcome: str,
+    carried: list[str],
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    """Per product-store: the observed series, the window, and the carried row.
+
+    Also where the contiguity invariant is enforced. Week arithmetic is what
+    makes a lag a lag; a gap makes `units_lag_1` mean something different in
+    every row.
+    """
+    state: dict[tuple[Any, ...], dict[str, Any]] = {}
+    history_by_key = dict(tuple(history.groupby(keys, observed=True, sort=True)))
+    for key, block in exog_weeks.groupby(keys, observed=True, sort=True):
+        key = key if isinstance(key, tuple) else (key,)
+        if key not in history_by_key:
+            raise KeyError(f"no history for product-store {key}")
+        past = history_by_key[key].sort_values("WEEK_NO")
+        window = block.sort_values("WEEK_NO")
+        weeks = window["WEEK_NO"].astype(int).tolist()
+
+        expected = list(range(weeks[0], weeks[0] + len(weeks)))
+        if weeks != expected:
+            raise NonContiguousWeeksError(
+                f"{key}: rollout weeks {weeks} are not consecutive"
+            )
+        last_observed = int(past["WEEK_NO"].max())
+        if weeks[0] != last_observed + 1:
+            raise NonContiguousWeeksError(
+                f"{key}: history ends at week {last_observed} but the rollout "
+                f"starts at week {weeks[0]}; the gap would make units_lag_1 "
+                f"mean 'the last week we happened to have'"
+            )
+
+        state[key] = {
+            "series": {
+                int(w): float(u)
+                for w, u in zip(past["WEEK_NO"], past[outcome], strict=True)
+            },
+            "weeks": weeks,
+            "exog": window.reset_index(drop=True),
+            "observed": (
+                window[outcome].astype(float).tolist()
+                if outcome in window.columns
+                else [float("nan")] * len(weeks)
+            ),
+            "carried": {c: past.iloc[-1][c] for c in carried},
+        }
+    return state
+
+
+def _rollout_row(
+    state: dict[str, Any],
+    step: int,
+    recursive: list[str],
+    exogenous: list[str],
+    carried: list[str],
+) -> dict[str, Any]:
+    """One design row: recursive features from the path, the rest as supplied."""
+    week = state["weeks"][step]
+    series = state["series"]
+    row: dict[str, Any] = {}
+    for name in recursive:
+        if name.startswith("units_lag_"):
+            row[name] = series.get(week - int(name.rsplit("_", 1)[1]), np.nan)
+        else:
+            # Weeks w-W..w-1, matching Phase 2.6's frame exactly: the window
+            # ends at 1 PRECEDING, so it never includes its own week, and a
+            # partial window averages what exists rather than returning null.
+            span = int(name.rsplit("_", 1)[1])
+            values = [
+                series[w] for w in range(week - span, week) if w in series
+            ]
+            row[name] = float(np.mean(values)) if values else np.nan
+    exog_row = state["exog"].iloc[step]
+    for name in exogenous:
+        row[name] = exog_row[name]
+    for name in carried:
+        row[name] = state["carried"][name]
+    return row
 
 
 def write_diagnostics(diagnostics: dict[str, Any], path: str | Path) -> Path:
