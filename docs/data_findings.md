@@ -1648,3 +1648,77 @@ gaps is a weak requirement, not a safe one.
 every recorded cycle is a floor — one-week-only pairs contribute no gap and are
 the slowest buyers, and gaps are right-censored at 102 weeks. The diagnostics
 say so in the `floors_not_estimates` field rather than only here.
+
+---
+
+## Task 3.4 — Break-even
+
+Reproduce: `promo.audit.kappa_star()` and `promo.audit.margin_sweep()`.
+
+### The required incremental share is depth over margin, exactly
+
+`kappa_star = depth / margin`. The derivation is worth recording because the
+cancellation is not obvious. For promoted units `Q` at regular price `p`, depth
+`d`, gross margin rate `m`:
+
+- a promoted unit earns `p(1-d) - p(1-m) = p(m-d)`;
+- the incremental share `k` earns that on `kQ` units;
+- the `(1-k)Q` units that would have sold anyway each lose `p·d`;
+- break-even is `k·p(m-d) = (1-k)·p·d`.
+
+Both the price and the `kd` terms cancel, leaving `k·m = d`. **The required
+share depends on neither price nor volume** — only on the ratio of depth to
+margin. A test checks the algebra numerically on a worked example rather than
+trusting the cancellation.
+
+Since `k ≤ 1` iff `m ≥ d`, **the depth is itself the minimum margin at which a
+promotion can break even at all.** That is Task 5.2's `m_star` in the case where
+promotional cost is the discount subsidy only.
+
+### What the panel's own depths require
+
+75,451 treated, priced product-store-weeks. Median depth **24.2%**, p75 37.3%,
+p90 46.3%; **4.46% run deeper than 50%**.
+
+At the median depth of 24.2%:
+
+| assumed margin | 10% | 15% | 20% | 25% | 30% | 35% | 40% | 45% | 50% |
+|---|---|---|---|---|---|---|---|---|---|
+| required incremental share | — | — | — | 97% | 81% | 69% | 60% | 54% | 48% |
+
+A dash is arithmetically impossible: it asks for more incremental units than
+were sold. **The typical promotion in this panel needs a gross margin above
+24.2% before it can break even at any volume**, and at a 25% margin it needs
+97% of promoted units to be incremental — which no display promotion achieves.
+
+At the p90 depth of 46.3% only the 50% margin column is feasible at all, and it
+requires 93% incrementality.
+
+**This is the MVP 03 answer and it is an honest one.** The dataset has no COGS —
+`promo/io.py` establishes that by searching all 46 column names — so the sweep
+varies the assumption instead of inventing it. A merchant reads their own row.
+
+### `NO_MARGIN` is a returned reason code, not a missing value
+
+`kappa_star(depth, None)` returns `kappa=None` with `reason_code="NO_MARGIN"`
+and a detail line explaining that no margin can be derived. `kappa_star > 1`
+returns `reason_code="KAPPA_IMPOSSIBLE"`. Neither is an exception, so the gate
+can carry them into a `GateResult` in Task 3.5 without catching anything.
+
+### The grid is defined once
+
+`MARGIN_GRID` — 10% to 50% in 5-point steps, nine points — is written as
+literals rather than built by arithmetic, so no float drift can put 0.35 at
+0.35000000000000003 and make two tables disagree on a key. A test asserts the
+steps are exactly 0.05 and that `0.35 in MARGIN_GRID` holds exactly.
+
+Task 5.2 is the authority on this grid; the constant lives in `promo/audit.py`
+only because that module exists and `promo/accounting.py` does not yet.
+**Phase 5 must import it, never restate it.**
+
+### The sweep is optimistic wherever free goods were given away
+
+`kappa_star = d/m` counts the discount subsidy alone. Task 5.1 established that
+promotional cost is subsidy **plus free goods**, and the second component raises
+`m_star` above the depth. So every figure above is a floor on what the promotion
+needed to clear. Recorded in the sweep's `identity` field, not only here.

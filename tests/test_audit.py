@@ -7,6 +7,7 @@ are mostly mixed while the mixed levels hold almost no demand.
 
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +18,15 @@ from promo.audit import (
     AXES,
     DEFAULT_COVARIATES,
     LEAKAGE_AUC,
+    MARGIN_GRID,
     MEANINGFUL_MIXED_SHARE,
     PROPENSITY_HIGH,
     PROPENSITY_LOW,
     UnobservedRowsError,
     collisions,
     horizon_check,
+    kappa_star,
+    margin_sweep,
     overlap,
     variation_axes,
     write_diagnostics,
@@ -771,3 +775,144 @@ def test_real_horizon_check_runs_against_the_recorded_cycles() -> None:
     assert checked.iloc[0]["status"] == "HORIZON_TOO_SHORT"   # milk needs 3
     assert checked.iloc[2]["status"] == "OK"
     assert diag["too_short"] >= 1
+
+
+# --------------------------------------------------------------------------
+# Task 3.4 — break-even.
+# --------------------------------------------------------------------------
+
+
+def test_kappa_is_depth_over_margin() -> None:
+    result = kappa_star(0.20, 0.40)
+    assert result.kappa == pytest.approx(0.5)
+    assert result.feasible is True
+    assert result.reason_code is None
+    assert result.depth == 0.20 and result.margin == 0.40
+
+
+def test_kappa_derivation_holds_against_a_worked_example() -> None:
+    """Check the algebra numerically rather than trusting the cancellation.
+
+    100 units at a regular price of 10, depth 20%, margin 40%. At the required
+    share, incremental profit must exactly offset the subsidy on the units that
+    would have sold anyway.
+    """
+    p, q, d, m = 10.0, 100.0, 0.20, 0.40
+    k = kappa_star(d, m).kappa
+    gained = k * q * p * (m - d)          # margin earned on incremental units
+    given_away = (1 - k) * q * p * d      # subsidy on units that would have sold
+    assert gained == pytest.approx(given_away)
+
+
+def test_margin_none_returns_no_number_and_a_reason_code() -> None:
+    """The dataset has no COGS, so this is the honest default."""
+    result = kappa_star(0.25, None)
+    assert result.kappa is None
+    assert result.feasible is None
+    assert result.reason_code == "NO_MARGIN"
+    assert "no COGS" in result.detail
+
+
+def test_depth_above_margin_is_arithmetically_impossible() -> None:
+    result = kappa_star(0.50, 0.30)
+    assert result.kappa == pytest.approx(0.5 / 0.3)
+    assert result.kappa > 1
+    assert result.feasible is False
+    assert result.reason_code == "KAPPA_IMPOSSIBLE"
+    assert "exceeds 100%" in result.detail
+
+
+def test_depth_equal_to_margin_is_exactly_feasible() -> None:
+    """kappa = 1: every promoted unit must be incremental, but it is possible."""
+    result = kappa_star(0.30, 0.30)
+    assert result.kappa == pytest.approx(1.0)
+    assert result.feasible is True
+    assert result.reason_code is None
+
+
+def test_zero_depth_needs_no_incrementality() -> None:
+    result = kappa_star(0.0, 0.30)
+    assert result.kappa == 0.0
+    assert result.feasible is True
+
+
+@pytest.mark.parametrize("depth", [-0.01, 1.5, float("nan")])
+def test_invalid_depth_raises(depth) -> None:
+    with pytest.raises(ValueError, match="depth must be in"):
+        kappa_star(depth, 0.3)
+
+
+@pytest.mark.parametrize("margin", [0.0, -0.1, 1.5, float("nan")])
+def test_invalid_margin_raises(margin) -> None:
+    with pytest.raises(ValueError, match="margin must be in"):
+        kappa_star(0.2, margin)
+
+
+def test_a_zero_margin_raises_rather_than_dividing_by_zero() -> None:
+    with pytest.raises(ValueError):
+        kappa_star(0.2, 0.0)
+
+
+def test_sweep_uses_the_nine_point_grid() -> None:
+    sweep, diag = margin_sweep(0.20)
+    assert list(sweep["margin"]) == list(MARGIN_GRID)
+    assert len(sweep) == 9
+    assert MARGIN_GRID[0] == 0.10 and MARGIN_GRID[-1] == 0.50
+    assert diag["grid"] == list(MARGIN_GRID)
+
+
+def test_grid_steps_are_exact_not_float_drift() -> None:
+    """Two tables keyed on these values must agree on every key."""
+    steps = [
+        round(b - a, 10) for a, b in pairwise(MARGIN_GRID)
+    ]
+    assert steps == [0.05] * 8
+    assert 0.35 in MARGIN_GRID   # exact membership, not approximate
+
+
+def test_sweep_marks_the_infeasible_margins() -> None:
+    sweep, diag = margin_sweep(0.30)
+    by_margin = sweep.set_index("margin")
+    # Below a 30% margin a 30% discount cannot pay for itself.
+    assert not by_margin.loc[0.10, "feasible"]
+    assert not by_margin.loc[0.25, "feasible"]
+    assert by_margin.loc[0.30, "feasible"]
+    assert by_margin.loc[0.50, "feasible"]
+    assert diag["infeasible_margins"] == [0.10, 0.15, 0.20, 0.25]
+
+
+def test_minimum_viable_margin_equals_the_depth() -> None:
+    """k <= 1 iff m >= d, so the depth is the break-even margin here."""
+    for depth in (0.05, 0.22, 0.40):
+        _, diag = margin_sweep(depth)
+        assert diag["minimum_viable_margin"] == pytest.approx(depth)
+        assert all(m >= depth for m in diag["feasible_margins"])
+        assert all(m < depth for m in diag["infeasible_margins"])
+
+
+def test_a_deep_discount_is_infeasible_across_the_whole_grid() -> None:
+    sweep, diag = margin_sweep(0.60)
+    assert not sweep["feasible"].any()
+    assert diag["feasible_at_any_grid_margin"] is False
+    assert diag["reason_code"] == "KAPPA_IMPOSSIBLE"
+    assert diag["feasible_margins"] == []
+
+
+def test_sweep_needs_no_margin_which_is_the_point() -> None:
+    """It varies the assumption instead of requiring one."""
+    _, diag = margin_sweep(0.20)
+    assert "no margin is imputed anywhere" in diag["reading"]
+    assert diag["headline"].startswith("A 20.0% discount needs a gross margin")
+
+
+def test_sweep_records_that_free_goods_make_it_optimistic() -> None:
+    """Task 5.1's second cost component raises m_star above the depth."""
+    _, diag = margin_sweep(0.20)
+    assert "free goods" in diag["identity"]
+    assert "optimistic" in diag["identity"]
+
+
+def test_sweep_accepts_a_custom_grid() -> None:
+    sweep, diag = margin_sweep(0.20, margins=(0.15, 0.25))
+    assert list(sweep["margin"]) == [0.15, 0.25]
+    assert diag["grid"] == [0.15, 0.25]

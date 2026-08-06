@@ -46,6 +46,8 @@ pile up as spurious "never treated" mass.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -60,13 +62,17 @@ __all__ = [
     "AXES",
     "DEFAULT_COVARIATES",
     "LEAKAGE_AUC",
+    "MARGIN_GRID",
     "MAX_COLLISION_SHARE",
     "MEANINGFUL_MIXED_SHARE",
     "PROPENSITY_HIGH",
     "PROPENSITY_LOW",
+    "KappaResult",
     "UnobservedRowsError",
     "collisions",
     "horizon_check",
+    "kappa_star",
+    "margin_sweep",
     "overlap",
     "variation_axes",
     "write_diagnostics",
@@ -103,6 +109,17 @@ PROPENSITY_HIGH: float = 0.98
 #: leakage is the first explanation to rule out, not the last.
 LEAKAGE_AUC: float = 0.95
 
+#: The assumed-margin grid: 10% to 50% in 5-point steps, nine points. Written
+#: as literals rather than built by arithmetic so no float drift can put 0.35
+#: at 0.35000000000000003 and make two tables disagree on a key.
+#:
+#: Task 5.2 is the authority on this grid. It lives here because audit.py is
+#: what exists; `promo/accounting.py` must import it rather than restate it, or
+#: the gate's sweep and the accounting table can silently diverge.
+MARGIN_GRID: tuple[float, ...] = (
+    0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+)
+
 #: Share of treated rows (or of controls) that may carry a second promotional
 #: mechanic before the estimand stops being a single-treatment effect. Not a
 #: recorded decision — the plan asks for the check, not a bar — so it is a
@@ -114,6 +131,23 @@ MAX_COLLISION_SHARE: float = 0.05
 
 class UnobservedRowsError(Exception):
     """The panel contains rows where treatment was never observed."""
+
+
+@dataclass(frozen=True)
+class KappaResult:
+    """The required incremental share, or why there is not one.
+
+    `kappa` is None exactly when `margin` is None: the dataset has no COGS, so
+    a break-even share cannot be computed without an assumption the user
+    supplies. That is a refusal with a reason code, not a missing value.
+    """
+
+    depth: float
+    margin: float | None
+    kappa: float | None
+    feasible: bool | None
+    reason_code: str | None
+    detail: str
 
 
 def variation_axes(
@@ -944,6 +978,156 @@ def horizon_check(
         ),
     }
     return checked, diagnostics
+
+
+def kappa_star(depth: float, margin: float | None) -> KappaResult:
+    """The incremental share a promotion needs to break even.
+
+    `kappa_star = depth / margin`. The derivation is short and the result is
+    cleaner than it looks, which is worth showing because the cancellation is
+    not obvious. For promoted units `Q` at regular price `p`, depth `d` and
+    gross margin rate `m`:
+
+    - a promoted unit earns `p(1-d) - p(1-m) = p(m-d)`;
+    - an incremental share `k` earns that on `kQ` units;
+    - the `(1-k)Q` units that would have sold anyway each lose `p·d`;
+    - break-even is `k·p(m-d) = (1-k)·p·d`, and both the price and the `kd`
+      terms cancel, leaving `k·m = d`.
+
+    So the required incremental share is depth over margin, exactly, with no
+    dependence on price or volume.
+
+    **`kappa_star > 1` is arithmetically impossible**, not merely unlikely: it
+    asks for more incremental units than were sold. Since `k <= 1` iff
+    `m >= d`, the depth *is* the minimum margin at which the promotion can
+    break even at all — which is Task 5.2's `m_star` in the case where
+    promotional cost is subsidy only.
+
+    Args:
+        depth: discount depth in `[0, 1]`, from Task 2.3.
+        margin: gross margin rate in `(0, 1]`. **Required and user-supplied.**
+            This dataset has no COGS — `promo/io.py` establishes it by searching
+            all 46 column names — so `None` is the honest default and returns
+            no number.
+
+    Returns:
+        A `KappaResult`. When `margin is None`, `kappa` is None and
+        `reason_code` is `NO_MARGIN`.
+
+    Raises:
+        ValueError: depth outside `[0, 1]`, or a supplied margin outside
+            `(0, 1]`.
+    """
+    if math.isnan(depth) or not (0.0 <= depth <= 1.0):
+        raise ValueError(f"depth must be in [0, 1], got {depth!r}")
+
+    if margin is None:
+        return KappaResult(
+            depth=depth,
+            margin=None,
+            kappa=None,
+            feasible=None,
+            reason_code="NO_MARGIN",
+            detail=(
+                "No margin was supplied and none can be derived: this dataset "
+                "has no COGS column. The margin sweep is the answer instead — "
+                "it needs no margin because it varies one."
+            ),
+        )
+
+    if math.isnan(margin) or not (0.0 < margin <= 1.0):
+        raise ValueError(f"margin must be in (0, 1], got {margin!r}")
+
+    kappa = depth / margin
+    feasible = kappa <= 1.0
+    return KappaResult(
+        depth=depth,
+        margin=margin,
+        kappa=kappa,
+        feasible=feasible,
+        reason_code=None if feasible else "KAPPA_IMPOSSIBLE",
+        detail=(
+            f"{kappa:.1%} of promoted units must be incremental to break even "
+            f"at a {margin:.0%} margin."
+            if feasible
+            else (
+                f"Breaking even needs {kappa:.1%} of promoted units to be "
+                f"incremental, which exceeds 100%. At a {margin:.0%} margin a "
+                f"{depth:.1%} discount cannot pay for itself at any volume."
+            )
+        ),
+    )
+
+
+def margin_sweep(
+    depth: float,
+    margins: tuple[float, ...] | list[float] = MARGIN_GRID,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Required incremental share across the assumed-margin grid.
+
+    This is the honest MVP 03 answer on a dataset with no COGS. It needs no
+    margin because it varies one: a merchant who knows theirs reads their own
+    row off the table.
+
+    Returns:
+        `(sweep, diagnostics)`. `sweep` has one row per margin with the required
+        incremental share and whether it is achievable.
+
+    Raises:
+        ValueError: depth outside `[0, 1]`, or any margin outside `(0, 1]`.
+    """
+    rows = []
+    for margin in margins:
+        result = kappa_star(depth, margin)
+        rows.append(
+            {
+                "margin": margin,
+                "kappa_star": result.kappa,
+                "feasible": result.feasible,
+                "reason_code": result.reason_code,
+            }
+        )
+    sweep = pd.DataFrame(rows)
+
+    feasible = sweep[sweep["feasible"]]
+    # k <= 1 iff m >= d, so the depth itself is the minimum margin at which the
+    # promotion can break even. Reported as a number rather than left implicit
+    # in the table.
+    minimum_margin = depth
+    return sweep, {
+        "stage": "margin_sweep",
+        "depth": depth,
+        "grid": list(margins),
+        "grid_source": (
+            "Task 5.2 is the authority on this grid: 10% to 50% in 5-point "
+            "steps. MARGIN_GRID is the single definition; promo/accounting.py "
+            "must import it rather than restate it, or the gate's sweep and the "
+            "accounting table can silently disagree."
+        ),
+        "minimum_viable_margin": round(minimum_margin, 6),
+        "feasible_margins": [round(float(m), 6) for m in feasible["margin"]],
+        "infeasible_margins": [
+            round(float(m), 6) for m in sweep.loc[~sweep["feasible"], "margin"]
+        ],
+        "feasible_at_any_grid_margin": bool(len(feasible)),
+        "headline": (
+            f"A {depth:.1%} discount needs a gross margin of at least "
+            f"{minimum_margin:.1%} before it can break even at any volume."
+        ),
+        "reason_code": None if len(feasible) else "KAPPA_IMPOSSIBLE",
+        "reading": (
+            "Read the row for the margin you actually run, not the table's "
+            "average. The pipeline cannot know your margin and does not guess: "
+            "no margin is imputed anywhere."
+        ),
+        "identity": (
+            "kappa_star(m) = m_star / m, where m_star is Task 5.2's break-even "
+            "margin. Here m_star is the depth, because this ratio counts the "
+            "discount subsidy only. Task 5.1's free goods are a second cost "
+            "component and raise m_star above the depth, so this sweep is "
+            "optimistic wherever free goods were given away."
+        ),
+    }
 
 
 def write_diagnostics(diagnostics: dict[str, Any], path: str | Path) -> Path:
