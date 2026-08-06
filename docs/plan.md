@@ -298,7 +298,21 @@ report a bare product count.
 Both codes carry the product's `n_weeks_priced` and `deal_share` in `detail`, so
 the refusal message states the evidence rather than only the verdict.
 
-**Done when:** `run_audit()` returns a full verdict for a real campaign, every reason code has a test that fires it, and the pipeline provably stops on refuse.
+**Done when:** `run_audit()` returns a full verdict for a real campaign, every reason code **whose detection exists within Phase 3** has a test that fires it, and the pipeline provably stops on refuse.
+
+**`PLACEBO_OVERLAP` and `ROI_UNBOUNDED` are declared here but not detectable
+here.** `PLACEBO_OVERLAP` needs the placebo band from Task 4.5's
+`promo/validate.py`; `ROI_UNBOUNDED` needs the bootstrap denominator interval
+from Task 5.2's `promo/accounting.py`. Both require estimation machinery that
+Phase 3 deliberately precedes — building the gate before the model is the whole
+argument. Their firing tests are conditions on **those tasks' Done when**, where
+they are already written, not on this one.
+
+**This is a rewording to make the gate checkable within its own phase, not a
+relaxation.** The original condition could never be true at the end of Phase 3,
+which makes it a poor gate rather than a strict one. The two obligations move to
+the phases that can discharge them; they do not disappear, and neither phase can
+close without them.
 
 This is your first demoable checkpoint. If everything after this failed, you would still have the strongest version of the lecture's own argument.
 
