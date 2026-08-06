@@ -209,7 +209,16 @@ Rule: no silent filters. A filter whose effect is not recorded is indistinguisha
 
 ### Task 2.3 — Price decomposition
 
-> **Prompt:** Write `promo/prices.py`. Aggregate cleaned transactions to PRODUCT_ID × STORE_ID × WEEK_NO, computing units, sales value, and each discount component summed. Derive: paid price per unit; regular price per unit using the reconstruction chosen in Phase 1; discount depth as 1 minus paid over regular; and three separate depth components for loyalty, manufacturer coupon, and coupon match. Add an `identified` versus `bounded` flag per product: bounded if the product is on deal in more than 90% of its weeks, since its depth is then ordinal only.
+> **Prompt:** Write `promo/prices.py`. Aggregate cleaned transactions to PRODUCT_ID × STORE_ID × WEEK_NO, computing units, sales value, and each discount component summed. Derive: paid price per unit; regular price per unit using the reconstruction chosen in Phase 1; discount depth as 1 minus paid over regular; and three separate depth components for loyalty, manufacturer coupon, and coupon match. Add a three-valued `price_status` flag per product: `bounded` if the product is on deal in more than 90% of its priced weeks, since its depth is then ordinal only; `insufficient_support` if it has fewer than 8 distinct priced weeks, since then nothing can be said about its depth in either direction; `identified` otherwise.
+
+**Support is tested before depth, and the order carries the argument.** A deal
+share computed on one or two weeks is not an ordinal depth — it is noise, and
+calling it `bounded` claims a diagnosis the data cannot support. A product seen
+once, on deal, has a deal share of 1.0 and is not a perpetually-discounted
+product. Count support in **distinct weeks**, not product-store-weeks: ten
+stores carrying a product in one week is one week of price history, not ten.
+Phase 3 refuses the two under different reason codes; see Task 3.5 for why the
+distinction is a product decision and not a taxonomy preference.
 
 ### Task 2.4 — Price index and deflation
 
@@ -259,7 +268,35 @@ Since this dataset has no COGS, that sweep *is* your MVP 03 answer, and it is an
 
 ### Task 3.5 — The refusal engine
 
-> **Prompt:** Write `promo/gates.py` with a `GateResult` pydantic model (gate, status, reason_code, detail, message) and a deterministic message template for each reason code: NO_VARIATION, NO_OVERLAP, LEAKED_FEATURE, DEPTH_BOUNDED, KAPPA_IMPOSSIBLE, NO_MARGIN, PLACEBO_OVERLAP, OVERLAPPING_TREATMENTS, ROI_UNBOUNDED, HORIZON_TOO_SHORT. Write a `run_audit()` that returns a list of GateResults and short-circuits the pipeline on any refuse. Add tests that construct data guaranteed to trigger each code.
+> **Prompt:** Write `promo/gates.py` with a `GateResult` pydantic model (gate, status, reason_code, detail, message) and a deterministic message template for each reason code: NO_VARIATION, NO_OVERLAP, LEAKED_FEATURE, DEPTH_BOUNDED, INSUFFICIENT_SUPPORT, KAPPA_IMPOSSIBLE, NO_MARGIN, PLACEBO_OVERLAP, OVERLAPPING_TREATMENTS, ROI_UNBOUNDED, HORIZON_TOO_SHORT. Write a `run_audit()` that returns a list of GateResults and short-circuits the pipeline on any refuse. Add tests that construct data guaranteed to trigger each code.
+
+**`INSUFFICIENT_SUPPORT` and `DEPTH_BOUNDED` are separate codes and must stay
+separate.** Task 2.3 assigns every product one of three `price_status` values,
+and the last two are different diagnoses that a category manager acts on
+differently:
+
+| status | reason code | what it says | what to do about it |
+|---|---|---|---|
+| `identified` | — | depth is cardinal | measure it |
+| `bounded` | `DEPTH_BOUNDED` | on deal in over 90% of its priced weeks, so the regular price is barely observed and depth is **ordinal only** | rank this product's deals against each other; stop running it at every depth if you want its shelf price back |
+| `insufficient_support` | `INSUFFICIENT_SUPPORT` | fewer than 8 distinct priced weeks, so **nothing** can be said about depth in either direction | this is a data problem, not a pricing problem — no action on the promotion is implied |
+
+Collapsing the two would tell a manager that a product they have run four times
+is permanently discounted. On this dataset the distinction is not marginal:
+**63,929 products (69.6%) are `insufficient_support` and only 3,445 (3.7%) are
+`bounded`.** Under a two-way rule, 14,772 of the thin products would have been
+labelled `bounded` — four times the genuine count — because a product seen once,
+on deal, has a deal share of 1.0.
+
+The size of each group in money is the reason neither code is a footnote:
+`identified` covers 26.7% of products but **75.5% of sales value**, `bounded`
+3.7% and 15.0%, `insufficient_support` 69.6% and **9.6%**. A refusal that covers
+seven products in ten but under a tenth of the money is exactly the shape a
+useful long-tail refusal should have, and the audit should say so rather than
+report a bare product count.
+
+Both codes carry the product's `n_weeks_priced` and `deal_share` in `detail`, so
+the refusal message states the evidence rather than only the verdict.
 
 **Done when:** `run_audit()` returns a full verdict for a real campaign, every reason code has a test that fires it, and the pipeline provably stops on refuse.
 

@@ -46,7 +46,48 @@ produced, rather than chosen after seeing results.
 
 **Still open**, and not part of this list — each is recorded in its own section:
 the `causal_data` duplicate-key resolution rule and the collapse-before-join
-requirement (Task 1.4), and the price level test owed in Task 2.3 (Task 1.3).
+requirement (Task 1.4).
+
+**Closed since Phase 1:** the price level test owed by Task 1.3 was run in Task
+2.3 and **confirms decision 3** — reconstruction A is closer to the observed
+regular price on 6.75% of test groups and B on none. See *The level test* at the
+end of Task 1.3.
+
+**Added in Task 2.3:** a sixth settled decision, on price-status support.
+
+| # | Decision | From |
+|---|---|---|
+| 6 | **A product needs at least 8 distinct priced weeks before anything is claimed about its depth.** Below that it is `insufficient_support`, tested before the bounded rule. | Task 2.3 |
+
+**On (6):** the two-way identified/bounded split conflated two different
+failures. 18,217 products looked `bounded`, but their median support was **one**
+priced product-store-week — they were not perpetually discounted, they were
+barely observed. Separating them leaves **3,445 genuinely bounded** products and
+moves **14,772** to `insufficient_support`.
+
+The threshold is 8 for three independent reasons that agree:
+
+1. **Precedent.** Task 1.3 required at least 8 weeks of a product before scoring
+   its price stability. Same question, same bar.
+2. **Inference.** At the observed on-deal base rate of 50.25%, eight consecutive
+   on-deal weeks arise by chance with probability 0.5⁸ ≈ **0.4%**, so "always on
+   deal" is a real inference at eight weeks. At three weeks it is 12.5% — a
+   coin-flip dressed as a finding.
+3. **Modelling.** Task 2.6's middle rolling window is 8 weeks. A product that
+   cannot fill it has no rolling feature to be modelled on.
+
+What the threshold costs, and why it is affordable:
+
+| status | products | share | units | sales value |
+|---|---:|---:|---:|---:|
+| `identified` | 24,537 | 26.7% | 79.54% | **75.45%** |
+| `bounded` | 3,445 | 3.7% | 15.06% | 14.99% |
+| `insufficient_support` | 63,929 | 69.6% | 5.40% | **9.56%** |
+
+**Seven products in ten, under a tenth of the money.** That asymmetry is the
+justification: the refusal is wide in the catalogue and narrow in revenue, which
+is the correct shape for a long-tail exclusion. 19 of the thin products have no
+reconstructable price at all and are a subset of this status, not a fourth one.
 
 ---
 
@@ -453,17 +494,52 @@ These are conditions on the code that implements A, not suggestions.
    doubles in thread-arrival order — and the same hazard applies to any price
    equality test, modal-price grouping, or "did the price change" check.
 
-### Outstanding — to be run in Task 2.3
+### The level test — run in Task 2.3, decision 3 stands
 
-**The level test has not been run.** The evidence above establishes that A's
-prices are more *concentrated* than B's; it does not establish that A's *level*
-is the true shelf price, because the stability criterion would also reward a
-constant. The test: compare the reconstructed price against the observed paid
-price on rows where all three discount columns are zero, where the paid price
-*is* the regular price by construction. If A is right, the two should agree
-within a cent for the same product-store-week. Run it in Task 2.3 as a validity
-check on the price decomposition, and record the result here. Should it fail,
-this decision is reopened.
+Reproduce: `promo.prices.level_test()`; the result is stored under `level_test`
+in `data/interim/prices_diagnostics.json`.
+
+The Phase 1 evidence established that A's prices are more *concentrated* than
+B's. Concentration is not correctness — a constant would score perfectly. The
+test owed here was of the *level*: within a product-store-week holding both
+undiscounted and discounted rows, the undiscounted rows show the regular price
+directly, so the reconstruction computed from the discounted rows can be scored
+against it. B is scored on the identical groups, so the test discriminates
+rather than merely describes.
+
+**5,350 product-store-weeks support the test** — those holding both kinds of
+row. A second pass at product-store grain, which relaxes the week requirement,
+carries 161,316 groups.
+
+| | A | B |
+|---|---:|---:|
+| median absolute error, product-store-week | **0.0000** | 0.0000 |
+| within 1 cent | **70.84%** | 64.11% |
+| within 5 cents | **72.36%** | 65.64% |
+| strictly closer to observed | **6.75%** | **0.00%** |
+| median absolute error, product-store | **0.0020** | 0.0133 |
+| strictly closer, product-store | **5.07%** | 0.34% |
+
+**A is closer on 6.75% of groups; B is closer on none of them.** The shape
+repeats Phase 1's 77–0 for the same reason: the two reconstructions are
+algebraically identical wherever `COUPON_DISC = 0`, so most groups tie, and
+every group that breaks the tie breaks it for A. At product-store grain, where
+more groups contain a coupon, B's median error is 6.7× A's.
+
+**DECISION 3 STANDS on level as well as on stability.** It is not reopened.
+
+**What the 29% that miss by more than a cent are, and why they do not bear on
+this question.** Their median signed error is **+0.19**, about **+10%**
+relative, and 62% overshoot. But **only 0.02% of them involve a coupon at all**,
+so they are not evidence about `COUPON_DISC` and cannot separate A from B. They
+are a different phenomenon: the observed regular price is not constant within a
+product-store-week, and the undiscounted row is not always at the shelf price —
+one `PRODUCT_ID` can span pack sizes, and a temporary price cut recorded through
+no discount column looks undiscounted. That the error is mostly positive says
+the reconstruction lands *above* those rows, which is what a mid-week markdown
+outside the three columns would produce. Task 2.4's price index is built from
+unpromoted rows and inherits this; it is a known limit, not a defect in the
+reconstruction.
 
 ---
 
@@ -900,3 +976,68 @@ that treats it as a decision not to buy is fitting shopping-trip frequency.
    and more if the p75 is used. Because of the censoring above, these are floors.
 4. **The horizon is per-commodity, not global.** A single 2-week window banks the
    peak for pasta sauce and misses its entire trough.
+
+---
+
+## Task 2.4 — The price index does not come back flat
+
+Reproduce: `promo.prices.build_price_index()`; the full result is in
+`data/interim/price_index_diagnostics.json`, the index itself in
+`data/interim/price_index.parquet`.
+
+**`docs/plan.md` predicted near-flat drift on this US dataset. It is not
+near-flat.** The chained matched-pair index rises **+16.68%** across weeks 1–102
+and **+16.31%** across the estimation window, weeks 18–101 — an annualised
+**+8.3%**. The prediction was wrong and the number is reported as measured.
+
+### What was checked before reporting it
+
+| check | result | rules out |
+|---|---:|---|
+| trimmed 5% of extreme relatives | +14.48% | a handful of outliers carrying the chain |
+| direct fixed-base index, week *w* vs week 1 | ≈ +17.8% by week 101 | chain drift from bouncing prices |
+| weeks with an imputed link | 0 of 102 | thin links propped up by 1.0 |
+| minimum matched pairs in any week | 40 | a link resting on nothing |
+
+The chained and the fixed-base constructions agree, so this is not the classic
+scanner-data chain drift. Trimming moves it by two points, so it is not
+outliers.
+
+### The composition finding, which is the actually interesting one
+
+Three measurements of the same 102 weeks, answering three different questions:
+
+| measure | drift | what it asks |
+|---|---:|---|
+| **matched** (the index) | **+16.68%** | what happened to the price of a *fixed* item |
+| balanced panel, 684 product-stores present in ≥40 weeks | +11.81% | same, by brute force rather than by matching |
+| **pooled** — geometric mean of every undiscounted price that week | **−6.83%** | what the average price paid did |
+
+**The matched index and the naive average move in opposite directions.** The
+pool of undiscounted observations grows from about 3,700 to 13,106 per week as
+the household panel fills, and the entrants are cheaper items. A fixed item got
+more expensive; the basket got cheaper, because the basket changed.
+
+This is exactly what a price index is for, and it is the sentence to say on
+stage: *the average price paid fell 7% while prices rose 17%, and only one of
+those is inflation.* A pipeline that deflated by the pooled figure would push
+real prices the wrong way by a quarter over two years.
+
+### What this does not establish
+
+- **Whether +16.7% is real inflation or a residual artefact.** The matched and
+  balanced figures differ by five points, which is more than sampling noise
+  should give. The dataset carries no calendar dates — only `DAY` 1–711 — so it
+  cannot be checked against a published CPI series for the period, and there is
+  no external anchor available.
+- The 29% of level-test groups whose reconstruction misses by more than a cent
+  (Task 1.3, *The level test*) indicate within-week price heterogeneity under a
+  single `PRODUCT_ID`. Pack-size mix inside one identifier moves a unit value
+  without any price moving, and the index inherits that.
+
+**Consequence for the pipeline.** Deflation is load-bearing here, not
+decorative. `deflate_prices()` adds `real_paid_price` and `real_regular_price`
+alongside the nominal columns and overwrites neither: Phase 5 accounting is in
+the currency the shopper actually paid, and only cross-week price *comparisons*
+use real terms. Depth is a within-week ratio, so the index cancels and depth
+needs no real counterpart — asserted in the tests rather than assumed.
