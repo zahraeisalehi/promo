@@ -1352,3 +1352,90 @@ the holiday flag has no calendar anchor; and 103,666 panel rows are unobserved
 rather than untreated and must never serve as controls. A stage whose
 diagnostics file is missing is named in `sources`, so the report can never be
 short without saying so.
+
+---
+
+## Task 3.1 — Variation on the scoped panel
+
+Reproduce: `promo.audit.variation_axes()`; result in
+`data/interim/variation_diagnostics.json`.
+
+Task 1.4 measured variation at entity level on the full panel, weighting every
+product equally. This is the same shape weighted by **units**, on the scoped
+modelling panel — the slice `data_findings.md` already directed the gate to use.
+
+| axis | fully treated | fully untreated | **mixed** |
+|---|---:|---:|---:|
+| product | 0.00% | 25.67% | **74.33%** |
+| store | 0.00% | 0.01% | **99.99%** |
+| week | 0.00% | 0.00% | **100.00%** |
+
+Shares are of units. **No level on any axis is fully treated** — every treated
+product has untreated weeks, and every treated store has untreated
+product-weeks. There is comparison mass everywhere the estimator might look.
+
+### Finding: a quarter of the scoped panel can never inform a display effect
+
+**72 of the 300 scoped products are never on display — and all 72 are
+mailer-only.** Not one is untreated on both mechanics.
+
+The cause is a mismatch inside Task 2.6's scope rule. It selects the top N
+products from those *ever treated*, where ever-treated is
+`BOOL_OR(on_display) OR BOOL_OR(in_mailer)` — either mechanic. But the treatment
+is `display` (settled decision 4). A product carried only in the mailer
+therefore passes the scope filter and then contributes nothing to estimating the
+thing being measured.
+
+It is not free: those 72 products carry **709,590 rows and 25.67% of the scoped
+panel's units**. `CLAUDE.md`'s own justification for the ever-treated rule —
+"an untreated-only product cannot contribute to estimating a treatment effect,
+so it consumes the row budget and returns nothing" — applies to them exactly,
+and the rule as implemented does not catch them.
+
+This is a scope-efficiency problem, not a correctness one. Those rows are valid
+untreated observations and can serve as controls; they simply cannot be treated
+observations.
+
+### DECISION — the 72 are kept as controls
+
+**They are retained deliberately as untreated controls, not by oversight.** The
+panel is not rebuilt.
+
+**The effective treated product count is therefore 228, not 300.** Quote 228
+whenever the estimator's base is described; 300 is the scoped product count and
+overstates what can carry a treated observation by a third.
+
+The rationale is that a control is not waste. The scope rule was written to
+avoid spending the row budget on products that "return nothing", and a
+mailer-only product does return something — 709,590 rows of untreated
+observation in the same stores and weeks as the treated ones, from products
+selected for being high-frequency. Discarding them to buy more treated products
+would trade control mass for treatment mass at a point where neither is scarce.
+
+**If the row budget becomes binding in Phase 4**, narrowing the scope rule from
+`BOOL_OR(on_display) OR BOOL_OR(in_mailer)` to `BOOL_OR(on_display)` frees
+**709,590 rows** for products that can actually switch. That is the lever to
+reach for, and it requires rebuilding Task 2.6's panel.
+
+### The scope-rule mismatch, recorded rather than inferred
+
+Task 2.6 scopes on **either** mechanic while the treatment is **display alone**.
+That mismatch is now stated in three places rather than left to be reconstructed
+from two diagnostics files: `scope_rule_mismatch` in
+`variation_diagnostics.json`, the `unresolved` list in `quality.json`, and here.
+`treated_base` in the variation diagnostics carries the 228 against the 300 so
+the effective count travels with the audit that established it.
+
+### The audit is marginal, and cannot re-derive decision 4
+
+A level counts as mixed if it holds both kinds of observation *anywhere*. On the
+store axis both `display` (99.99%) and `mailer` (100.00%) come back essentially
+fully mixed, because a store need only have had something treated while
+something else was not.
+
+That is much weaker than the joint condition decision 4 rests on — variation
+across stores *within a week, for the same product*, where display scores 65.34%
+and mailer 2.28%. **This module cannot separate the two treatments and must not
+be cited as if it could.** It reports the necessary condition; Task 3.2's overlap
+check is the one with teeth. The limitation is carried in the diagnostics under
+`limitation`, not only in the source, and is asserted by a test.

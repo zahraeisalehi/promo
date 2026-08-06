@@ -315,6 +315,37 @@ def test_report_is_written_as_json(tmp_path: Path) -> None:
     assert json.loads(out.read_text())["report"] == "Phase 2 data honesty"
 
 
+def test_scope_rule_mismatch_is_recorded_when_the_audit_is_supplied(
+    tmp_path: Path,
+) -> None:
+    """Visible in the report, not left to be inferred from two other files."""
+    variation = {
+        "treated_base": {
+            "products_in_panel": 300,
+            "effective_treated_products": 228,
+        },
+        "scope_rule_mismatch": {
+            "affected_products": 72,
+            "affected_rows": 709_590,
+        },
+    }
+    report, _ = build_quality_report(
+        tmp_path, variation=variation, out_path=tmp_path / "quality.json"
+    )
+    joined = " ".join(report["unresolved"])
+    assert "effective treated product count is 228, not 300" in joined
+    assert "retained deliberately as untreated controls" in joined
+    assert "709,590 rows" in joined
+    assert report["variation"] is variation
+
+
+def test_unresolved_omits_the_mismatch_when_no_audit_is_supplied(
+    tmp_path: Path,
+) -> None:
+    report, _ = build_quality_report(tmp_path, out_path=tmp_path / "quality.json")
+    assert not any("Scope-rule mismatch" in u for u in report["unresolved"])
+
+
 def test_report_lists_unresolved_limits(tmp_path: Path) -> None:
     report, _ = build_quality_report(tmp_path, out_path=tmp_path / "quality.json")
     joined = " ".join(report["unresolved"])

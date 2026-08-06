@@ -459,6 +459,7 @@ def build_quality_report(
     *,
     household: dict[str, Any] | None = None,
     repurchase: dict[str, Any] | None = None,
+    variation: dict[str, Any] | None = None,
     out_path: str | Path | None = "data/interim/quality.json",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Assemble every exclusion this phase made into one honesty report.
@@ -533,7 +534,8 @@ def build_quality_report(
         "treatment_coverage": _treatment_section(loaded),
         "household_availability": household,
         "repurchase": repurchase,
-        "unresolved": _unresolved(loaded),
+        "variation": variation,
+        "unresolved": _unresolved(loaded, variation),
     }
 
     if out_path is not None:
@@ -711,7 +713,9 @@ def _treatment_section(loaded: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _unresolved(loaded: dict[str, Any]) -> list[str]:
+def _unresolved(
+    loaded: dict[str, Any], variation: dict[str, Any] | None = None
+) -> list[str]:
     """Things a reader of the panel must not assume were handled."""
     items = [
         (
@@ -737,6 +741,21 @@ def _unresolved(loaded: dict[str, Any]) -> list[str]:
         items.append(
             f"{outside:,} panel rows sit outside causal_data's coverage. They "
             f"are unobserved, not untreated, and must never be used as controls."
+        )
+    mismatch = (variation or {}).get("scope_rule_mismatch")
+    base = (variation or {}).get("treated_base")
+    if mismatch and base:
+        items.append(
+            f"Scope-rule mismatch, recorded rather than left to be inferred: "
+            f"Task 2.6 scopes on BOOL_OR(on_display) OR BOOL_OR(in_mailer) "
+            f"while the treatment is display alone, so "
+            f"{mismatch['affected_products']} mailer-only products entered the "
+            f"panel and can never be treated. The effective treated product "
+            f"count is {base['effective_treated_products']}, not "
+            f"{base['products_in_panel']}. They are retained deliberately as "
+            f"untreated controls, not by oversight. If the row budget binds in "
+            f"Phase 4, narrowing the rule to display-only frees "
+            f"{mismatch['affected_rows']:,} rows."
         )
     return items
 
