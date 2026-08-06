@@ -57,6 +57,7 @@ import pandas as pd
 
 from promo.features import CONTEMPORANEOUS_FEATURES, LAGGED_FEATURES
 from promo.io import connect
+from promo.prices import BOUNDED_THRESHOLD, MIN_PRICED_WEEKS
 
 __all__ = [
     "AXES",
@@ -74,6 +75,7 @@ __all__ = [
     "kappa_star",
     "margin_sweep",
     "overlap",
+    "price_status_check",
     "variation_axes",
     "write_diagnostics",
 ]
@@ -978,6 +980,111 @@ def horizon_check(
         ),
     }
     return checked, diagnostics
+
+
+def price_status_check(
+    statuses: str | Path | pd.DataFrame = "data/interim/prices.parquet",
+    product: int | None = None,
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Is this product's discount depth cardinal, ordinal, or unsayable?
+
+    Task 2.3 assigns every product one of three statuses and Task 3.5 turns two
+    of them into refusals. This is the detection: it reads the per-product
+    columns and hands back the evidence a message needs.
+
+    **It does not read `panel.parquet`.** That file carries `price_status` but
+    Task 2.6's projection dropped `deal_share` and `n_weeks_priced`, which are
+    exactly the numbers a `DEPTH_BOUNDED` or `INSUFFICIENT_SUPPORT` message has
+    to quote. The default source is `prices.parquet`, which has all three.
+
+    Args:
+        statuses: a frame or parquet path carrying `PRODUCT_ID`,
+            `price_status`, `deal_share` and `n_weeks_priced`.
+        product: the product to judge. When None, the distribution across all
+            products is reported and no product-level verdict is possible —
+            see `product_supplied` in the diagnostics.
+        con: an existing DuckDB connection; one is opened and closed if omitted.
+
+    Returns:
+        `(rows, diagnostics)`. `rows` is one row per product, or the single
+        requested product's row, with its status and evidence.
+
+    Raises:
+        KeyError: a required column is missing from `statuses`.
+    """
+    wanted = ["PRODUCT_ID", "price_status", "deal_share", "n_weeks_priced"]
+    own = con is None
+    con = connect() if con is None else con
+    try:
+        if isinstance(statuses, pd.DataFrame):
+            missing = [c for c in wanted if c not in statuses.columns]
+            if missing:
+                raise KeyError(f"not columns of the statuses frame: {missing}")
+            frame = statuses[wanted].drop_duplicates("PRODUCT_ID")
+        else:
+            source = f"read_parquet('{Path(statuses).as_posix()}')"
+            available = {
+                r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+            }
+            missing = [c for c in wanted if c not in available]
+            if missing:
+                raise KeyError(
+                    f"not columns of {statuses}: {missing}. panel.parquet keeps "
+                    f"price_status but drops the evidence columns; use "
+                    f"prices.parquet or panel_treated.parquet."
+                )
+            frame = con.execute(
+                f"SELECT DISTINCT {', '.join(wanted)} FROM {source}"
+            ).df()
+    finally:
+        if own:
+            con.close()
+
+    counts = frame["price_status"].value_counts()
+    diagnostics: dict[str, Any] = {
+        "stage": "price_status_check",
+        "products": len(frame),
+        "status_counts": {str(k): int(v) for k, v in counts.items()},
+        "bounded_threshold": BOUNDED_THRESHOLD,
+        "min_priced_weeks": MIN_PRICED_WEEKS,
+        "product_supplied": product is not None,
+    }
+
+    if product is None:
+        diagnostics["what_this_can_say"] = (
+            "Without a product this reports the portfolio's distribution only. "
+            "It cannot refuse a campaign: DEPTH_BOUNDED and "
+            "INSUFFICIENT_SUPPORT are properties of a product, and a "
+            "commodity-level campaign spans many products with different "
+            "statuses. Supply CampaignSpec.product for a verdict."
+        )
+        return frame, diagnostics
+
+    rows = frame[frame["PRODUCT_ID"] == product]
+    if rows.empty:
+        diagnostics["status"] = None
+        diagnostics["found"] = False
+        diagnostics["what_this_can_say"] = (
+            f"Product {product} does not appear in the price table, so its "
+            f"depth status is unknown. Unknown is not a pass."
+        )
+        return rows, diagnostics
+
+    row = rows.iloc[0]
+    diagnostics.update(
+        {
+            "found": True,
+            "product": int(row["PRODUCT_ID"]),
+            "status": str(row["price_status"]),
+            "deal_share": (
+                None if pd.isna(row["deal_share"]) else float(row["deal_share"])
+            ),
+            "weeks_priced": int(row["n_weeks_priced"]),
+        }
+    )
+    return rows, diagnostics
 
 
 def kappa_star(depth: float, margin: float | None) -> KappaResult:

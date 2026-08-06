@@ -293,22 +293,27 @@ class GateResult(BaseModel):
     message: str          # plain language, written by narrate.py
 ```
 
-Reason codes worth implementing, each mapped to a sentence:
+Implemented in `promo/gates.py`. Severity is part of the code, not of the caller: `refuse` means the estimate is not identified and the pipeline stops, `bounded` means a weaker quantity survives and the run continues, `pass` is recorded for the audit trail.
 
-| code | trigger |
-|---|---|
-| `NO_VARIATION` | no axis has usable mixed mass |
-| `NO_OVERLAP` | AUC > 0.95 and extreme-propensity share high |
-| `LEAKED_FEATURE` | AUC > 0.95 but a feature correlates > 0.99 with D |
-| `DEPTH_BOUNDED` | SKU on deal above threshold share |
-| `KAPPA_IMPOSSIBLE` | κ* ≥ 1 |
-| `NO_MARGIN` | cogs absent — units and κ* only |
-| `PLACEBO_OVERLAP` | estimate inside the placebo band |
-| `OVERLAPPING_TREATMENTS` | two campaigns in one cell |
-| `ROI_UNBOUNDED` | denominator interval spans zero |
-| `HORIZON_TOO_SHORT` | horizon < repurchase cycle |
+| code | severity | trigger | what survives |
+|---|---|---|---|
+| `NO_VARIATION` | refuse | no axis has usable mixed unit mass | nothing — there is no comparison to make |
+| `NO_OVERLAP` | refuse | AUC ≥ 0.95 with gain spread across features | nothing — different populations |
+| `LEAKED_FEATURE` | refuse | AUC ≥ 0.95 and one feature holds ≥ 50% of gain | nothing — a defect, not a data limit |
+| `DEPTH_BOUNDED` | bounded | product on deal above 90% of its priced weeks | ordinal depth: its deals rank against each other |
+| `INSUFFICIENT_SUPPORT` | refuse | fewer than 8 distinct priced weeks | nothing — a coverage limit, no action implied |
+| `KAPPA_IMPOSSIBLE` | refuse | κ\* ≥ 1 at the supplied margin | the sweep computed before the stop |
+| `NO_MARGIN` | bounded | cogs absent and no margin supplied | break-even margin and the 10–50% sweep |
+| `PLACEBO_OVERLAP` | refuse | estimate inside the placebo band | nothing — noise reported as a finding |
+| `OVERLAPPING_TREATMENTS` | bounded | a second mechanic runs alongside the treatment | the joint effect, labelled as joint |
+| `ROI_UNBOUNDED` | bounded | denominator interval spans zero | incremental units and cost |
+| `HORIZON_TOO_SHORT` | refuse | horizon < repurchase cycle | nothing — the number is biased, not weak |
 
-The pipeline runner short-circuits on any `refuse` and returns the partial results computed so far. Partial output plus a stated reason is the product; a complete-looking output with a hidden failure is the thing you are arguing against.
+`INSUFFICIENT_SUPPORT` and `DEPTH_BOUNDED` are deliberately separate. "We cannot see this product enough to say anything" and "this product's depth is ordinal only" are different diagnoses, and a category manager acts on each differently — see settled decision 6.
+
+`PLACEBO_OVERLAP` and `ROI_UNBOUNDED` have templates and severities here but no detection yet. `run_audit()` cannot emit them, and their absence from a verdict must not be read as a pass. They are recorded as owed by **Task 4.5** and **Task 5.2** respectively, in each task's own **Done when**, so the phase gate for each will check that the code fires through `run_audit()`.
+
+Gates run cheapest first — `break_even`, `horizon`, `variation`, `collisions`, `overlap` — so a campaign that fails on arithmetic never pays for the model fit that costs two and a half minutes. The runner short-circuits on any `refuse` and returns the partial results computed so far. Partial output plus a stated reason is the product; a complete-looking output with a hidden failure is the thing you are arguing against. Pass `stop_on_refuse=False` to collect every verdict, since the short-circuit hides any problem after the first.
 
 ---
 

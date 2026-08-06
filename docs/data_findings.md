@@ -1722,3 +1722,127 @@ only because that module exists and `promo/accounting.py` does not yet.
 promotional cost is subsidy **plus free goods**, and the second component raises
 `m_star` above the depth. So every figure above is a floor on what the promotion
 needed to clear. Recorded in the sweep's `identity` field, not only here.
+
+---
+
+## Task 3.5 — The refusal engine
+
+Reproduce: `promo.gates.run_audit()`; a worked verdict in
+`data/interim/audit_soup.json`. The reason-code table lives in
+`docs/runbook.md`.
+
+**Eleven reason codes, each with a severity, a trigger and a deterministic
+message.** Severity belongs to the code, not to the caller: `refuse` stops the
+pipeline, `bounded` means a weaker quantity survives and the run continues,
+`pass` is recorded for the audit trail.
+
+Seven refuse — `NO_VARIATION`, `NO_OVERLAP`, `LEAKED_FEATURE`,
+`INSUFFICIENT_SUPPORT`, `KAPPA_IMPOSSIBLE`, `PLACEBO_OVERLAP`,
+`HORIZON_TOO_SHORT`. Four are bounded — `DEPTH_BOUNDED`, `NO_MARGIN`,
+`OVERLAPPING_TREATMENTS`, `ROI_UNBOUNDED` — and each names the weaker quantity
+that survives, which is what makes it bounded rather than a refusal.
+
+### The verdict on a real campaign
+
+A display promotion on `SOUP` at the panel's median depth of 24.2%, measured
+over a 9-week post-campaign window:
+
+| gate | status | code |
+|---|---|---|
+| break_even | bounded | `NO_MARGIN` |
+| horizon | pass | — |
+| variation | pass | — |
+| collisions | bounded | `OVERLAPPING_TREATMENTS` |
+
+**Verdict: bounded.** Two weaker quantities survive and both are stated —
+the break-even margin of 24.2% with its sweep, and a joint display-and-mailer
+effect rather than a clean display effect. Nothing is refused, and nothing is
+reported as if it were the clean quantity.
+
+### Short-circuiting is cheapest-first, and that is load-bearing
+
+`GATE_ORDER` is `break_even`, `horizon`, `variation`, `collisions`, `overlap`.
+The overlap check costs about two and a half minutes on the full panel;
+everything before it costs seconds. A campaign at 60% depth against a 30% margin
+stops at `break_even` having run one gate, so the arithmetic refusal never pays
+for a model fit. Asserted by a test.
+
+The short-circuit hides any problem after the first, which is a real cost:
+`stop_on_refuse=False` collects every verdict, and the diagnostics record
+`gates_run` and `gates_skipped` so a partial audit cannot be mistaken for a
+clean one.
+
+### Two codes are defined but cannot yet fire
+
+`PLACEBO_OVERLAP` and `ROI_UNBOUNDED` have templates, severities and rendering
+tests, but their detection belongs to Phases 4 and 5. `run_audit()` cannot emit
+them today. Recorded here and in the runbook so their absence from a verdict is
+not read as a pass.
+
+### What the message rules cost, and why they are tested
+
+The gate-authoring skill requires that a message name what is missing and what
+would fix it, never blame the caller, never use the word *error*, and never
+imply the effect does not exist when the truth is that this comparison cannot
+see it. All four are asserted for all eleven codes rather than left to review.
+
+Two failed on first write and were fixed rather than waived:
+
+- `OVERLAPPING_TREATMENTS` opened with an interpolated percentage, so the
+  sentence began with a digit.
+- `PLACEBO_OVERLAP` said what the result *was not* without saying what would
+  change it. It now names a larger promotion, more weeks, or closer comparison
+  weeks.
+
+The placebo message carries the project's sharpest distinction and has its own
+test: it must contain "not evidence that the promotion did nothing" and must
+never contain "no effect".
+
+---
+
+## Task 3.5 addendum — the price-status gate
+
+Reason codes that fire through `run_audit()` went from **7 of 11 to 9 of 11**.
+
+`DEPTH_BOUNDED` and `INSUFFICIENT_SUPPORT` had templates and severities from
+Task 3.5 but no detection wired: the codes existed and no gate could emit them.
+The Phase 3 verification caught it by instrumenting `gate_result` and recording
+which codes actually reached a `GateResult` during the test run, rather than by
+reading the tests — rendering a message is not firing a gate.
+
+### The gate reads `prices.parquet`, not `panel.parquet`
+
+`panel.parquet` carries `price_status` but Task 2.6's projection dropped
+`deal_share` and `n_weeks_priced` — the two numbers the messages have to quote.
+The gate therefore takes a `statuses` source defaulting to `prices.parquet`,
+mirroring how `horizon_check` takes `cycles`. Worth knowing before anyone
+assumes the modelling panel carries everything the gate needs.
+
+### What it can and cannot say without a product
+
+`CampaignSpec.product` is optional, so a commodity-level campaign still audits.
+When no product is named the gate returns `pass` and reports the portfolio
+distribution — 24,537 identified, 3,445 bounded, 63,929 insufficient support —
+while stating plainly that no verdict was reached, because a commodity spans
+products with different statuses and these two codes are properties of a
+product. An unknown product likewise passes with "it has not been shown to be
+usable" rather than silently clearing.
+
+### The two codes stay separate, and the severities prove it
+
+| status | code | severity | what survives |
+|---|---|---|---|
+| `bounded` | `DEPTH_BOUNDED` | bounded | ordinal depth — its deals rank against each other |
+| `insufficient_support` | `INSUFFICIENT_SUPPORT` | refuse | nothing — a coverage limit implying no action |
+| `identified` | — | pass | the depth is a usable number |
+
+A test asserts the severities differ, which is the whole point of settled
+decision 6: a bounded product is a pricing problem a manager can act on, a thin
+one is a data problem that implies nothing about the promotion.
+
+### Still owed, and now recorded where the phase gate will check
+
+`PLACEBO_OVERLAP` and `ROI_UNBOUNDED` remain unfireable. They are recorded in
+`docs/plan.md` against **Task 4.5** and **Task 5.2**, in each task's **Done
+when**, so each phase gate checks that the code fires through `run_audit()`
+rather than only that the detection exists.

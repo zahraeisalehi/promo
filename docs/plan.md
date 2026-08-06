@@ -363,7 +363,18 @@ and should be read alongside it.
 
 > **Prompt:** Write `promo/validate.py` with a placebo harness over at least 300 never-treated windows. Return the distribution and a helper that flags whether a given estimate falls inside it.
 
-**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, and every reported lift carries an interval and its placebo comparison.
+**This task owes `PLACEBO_OVERLAP`.** Task 3.5 defined the reason code, its
+severity (`refuse`), and its message template, but the detection belongs here:
+until this task lands, `run_audit()` cannot emit it and the Phase 3 verification
+records it as never fired. The helper that flags whether an estimate falls
+inside the band is the detection — wire it through `promo/gates.py` and add a
+test that fires the code and one that does not, per the gate-authoring skill.
+
+Its message carries this project's sharpest distinction and there is already a
+test asserting the wording: an estimate inside the band means **this comparison
+cannot see the effect**, never that the promotion had none.
+
+**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
 
 ---
 
@@ -445,6 +456,17 @@ them apart.
 
 > **Prompt:** In `promo/accounting.py`, add `breakeven_margin(campaign)` returning `m_star = promo_cost_total / incremental_revenue`, where `promo_cost_total` is the subsidy plus free goods from Task 5.1 and `incremental_revenue` is the Phase 4 incremental units valued at the promoted price. Return it as an **interval**, not a point: the numerator is known and the denominator is estimated, so propagate the lift interval through the ratio. Return `None` with reason code `ROI_UNBOUNDED` when the incremental-revenue interval spans zero — a promotion with no measurable lift has no finite break-even margin, and reporting a large one implies a precision that is not there.
 >
+**This task owes `ROI_UNBOUNDED`.** Task 3.5 defined the reason code, its
+severity (`bounded` — incremental units and cost survive, only the ratio is
+undefined), and its message template, but the detection belongs here: the
+denominator interval is what decides it. Until this task lands, `run_audit()`
+cannot emit it and the Phase 3 verification records it as never fired. Wire it
+through `promo/gates.py` and add a test that fires it and one that does not, per
+the gate-authoring skill.
+
+**Import `MARGIN_GRID` from `promo/audit.py`, never restate it.** It is written
+as literals there precisely so two tables keyed on margin cannot drift apart.
+
 > Then add `sensitivity_table(campaign)` returning incremental profit at assumed gross margins of **10%, 15%, 20%, 25%, 30%, 35%, 40%, 45%, and 50%** — nine columns, 5-point steps. Each cell is `m * incremental_revenue - promo_cost_total`, in currency, signed. Carry the lift interval into each cell so a cell whose sign is uncertain is marked as such rather than shown as a confident positive. The table is the campaign's answer; the break-even margin is where its sign flips.
 
 **Read the table, not a single number.** The nine columns exist so that the
@@ -496,7 +518,7 @@ into a box during the demo, and four screens later a ranked list of ROIs looks
 like a measurement. It is not one. It is arithmetic conditional on a number the
 user made up, and the system must keep saying so.
 
-**Done when:** every campaign has a break-even margin reported as an interval, a nine-column sensitivity table across 10–50% in 5-point steps, and either an ROI interval or a stated refusal; total promotional cost is reported as subsidy plus free goods, with the split visible and the unpriced residual stated rather than silently zeroed; campaigns with a break-even margin above 50% are flagged `KAPPA_IMPOSSIBLE`; and no figure derived from a supplied margin can leave the module without carrying `margin_source` and `conditional_on_margin`.
+**Done when:** every campaign has a break-even margin reported as an interval, a nine-column sensitivity table across 10–50% in 5-point steps, and either an ROI interval or a stated refusal; total promotional cost is reported as subsidy plus free goods, with the split visible and the unpriced residual stated rather than silently zeroed; campaigns with a break-even margin above 50% are flagged `KAPPA_IMPOSSIBLE`; no figure derived from a supplied margin can leave the module without carrying `margin_source` and `conditional_on_margin`; and **`ROI_UNBOUNDED` fires in a test through `run_audit()`** — the Phase 3 gate that Task 5.2 owes.
 
 ---
 
