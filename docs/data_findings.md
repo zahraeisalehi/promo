@@ -1158,3 +1158,104 @@ the money.** The 4.41% unobserved share decomposes into 35,820 rows from
 unlogged stores and 67,846 rows in logged stores but outside weeks 9–101 —
 summing exactly. Quote the sales share, not the store count; the store count
 understates coverage by a factor of five and invites a needless refusal.
+
+---
+
+## Task 2.6 — The modelling panel, and the holiday flag that cannot be built
+
+Reproduce: `promo.features.build_feature_panel()`; full result in
+`data/interim/feature_diagnostics.json`, panel in `data/interim/panel.parquet`.
+
+### The scope, and what it buys
+
+`CLAUDE.md` forbids the full 92,339 × 582 × 102 grid — 5.5 billion cells. The
+scope applied here is the top **300 products by transaction count, drawn from
+ever-treated products only**, the **115** logged stores, and weeks **9–101**.
+
+| | |
+|---|---:|
+| carried product-store pairs | 31,896 |
+| rows (pairs × 93 weeks) | **2,966,328** |
+| of which observed | 404,465 |
+| of which zero-filled | 2,561,863 (86.4%) |
+| share of all transactions | **20.83%** |
+| share of all sales value | **16.32%** |
+
+**Zeros are filled only for product-store pairs observed at least once.** The
+full cross product would be 3,208,500 rows; the extra 242,172 are shelves a
+store does not stock. Task 1.5 recorded that this dataset cannot distinguish
+"not stocked" from "stocked and unsold", so those rows would be invented demand
+observations, not zeros.
+
+### Finding: 79% of treated rows are weeks with no sale
+
+Task 2.5 joined treatment onto rows that recorded a sale. Once explicit zeros
+exist, the treatment has to be looked up again — and the reason is stark:
+
+| | rows |
+|---|---:|
+| treated rows in the scoped panel | 366,346 |
+| **of which sold nothing that week** | **290,895 (79.4%)** |
+
+A product can be on display and sell nothing, and `causal_data` is chain-wide so
+it records exactly that. Had the treatment been carried over from Task 2.5
+instead of re-derived, **four in five treated rows would have been silently
+labelled untreated** — and they would have entered the Phase 4 baseline as
+training data, since the baseline trains on `treated == 0`. That is the precise
+failure the "raise if treated rows reach the fit" invariant exists to catch, and
+it would have been introduced upstream of the check.
+
+### The holiday flag cannot be built from this dataset, and was not
+
+The plan asks for a holiday flag. **This dataset carries no calendar dates** —
+only `DAY` 1–711 and `WEEK_NO` 1–102, with no anchor to a real year. There is
+therefore no way to know which week contains which holiday.
+
+Two ways to fake it were rejected:
+
+- **Anchoring to a guessed year.** Any anchor is an assumption presented as a
+  fact, and every seasonal coefficient would inherit it.
+- **Inferring holiday weeks from demand spikes.** This builds a feature out of
+  the outcome it is meant to predict. It would improve fit and destroy the
+  estimate.
+
+`is_holiday_week` is therefore emitted as **False everywhere**, with
+`holiday_flag.populated = false` and the reason recorded in the diagnostics. It
+takes a `holiday_weeks` parameter, so an external anchor can populate it without
+a code change. **`week_of_year` carries the seasonality instead** — computed as
+`((WEEK_NO - 1) % 52) + 1`, a position in a 52-week cycle, which needs no
+calendar. A tree learns the December bump wherever it falls; it just cannot name
+it.
+
+### Feature missingness, all of it structural
+
+| feature | missing | why |
+|---|---:|---|
+| `price_rel_category` | 86.36% | a week with no sale has no observed price |
+| `units_lag_52` | 55.91% | the scope is 93 weeks, so the first 52 cannot have one |
+| `units_lag_4` | 4.30% | grid edge |
+| `units_lag_1`, all rolling means | 1.08% | grid edge |
+| everything else | 0.00% | |
+
+`price_rel_category` is left null rather than carried forward from the last
+priced week. Filling it would be a modelling choice, and an imputed price is
+indistinguishable from an observed one once it is in the column. LightGBM splits
+on null natively, so the feature still contributes where it exists.
+
+### Two leakage rules, both tested
+
+1. **No feature uses the current week's outcome.** Rolling means span *w−k .. w−1*
+   and never include *w*. A test recomputes every lag and window by hand against
+   a shifted series and fails on an off-by-one.
+2. **No feature is derived from the promotion.** `price_rel_category` uses the
+   reconstructed **regular** price, never the paid price — a paid price is low
+   precisely *because* the product is on deal, so a control built on it encodes
+   the treatment.
+
+**A caveat the tests cannot settle.** `store_traffic` and
+`category_units_ex_focal` are contemporaneous, and both can be *affected by* the
+promotion. Conditioning on a mediator absorbs part of the effect. They are not
+future information and the plan asks for them, so they are built — but the
+diagnostics tag every feature `lagged` or `contemporaneous`, and Phase 3 should
+report the estimate with and without the contemporaneous block rather than
+assume the controls are innocent.

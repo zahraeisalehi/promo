@@ -23,10 +23,20 @@ from promo.treatment import (
 PANEL = Path("data/interim/prices.parquet")
 CAUSAL = Path("data/raw/causal_data.csv")
 
-real_data = pytest.mark.skipif(
-    not PANEL.exists() or not CAUSAL.exists(),
-    reason="run Task 2.4 first, and data/raw must be populated",
-)
+_NO_DATA = not PANEL.exists() or not CAUSAL.exists()
+
+
+def real_data(fn):
+    """Marks a test that reads a real artefact from data/interim.
+
+    Heavy by definition — see "Test discipline" in CLAUDE.md — so the fast
+    pass excludes it with -m "not heavy", and it is skipped outright when
+    the artefact is absent.
+    """
+    return pytest.mark.skipif(_NO_DATA, reason="run Task 2.4 first, and data/raw must be populated")(
+        pytest.mark.heavy(fn)
+    )
+
 
 
 def _panel(keys: list[tuple[int, int, int]]) -> pd.DataFrame:

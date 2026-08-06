@@ -26,10 +26,20 @@ from promo.io import (
 RAW = Path("data/raw")
 INTERIM = Path("data/interim")
 
-real_data = pytest.mark.skipif(
-    not all((RAW / s.filename).exists() for s in TABLE_SPECS.values()),
-    reason="data/raw is not populated",
-)
+_NO_DATA = not all((RAW / s.filename).exists() for s in TABLE_SPECS.values())
+
+
+def real_data(fn):
+    """Marks a test that reads a real artefact from data/interim.
+
+    Heavy by definition — see "Test discipline" in CLAUDE.md — so the fast
+    pass excludes it with -m "not heavy", and it is skipped outright when
+    the artefact is absent.
+    """
+    return pytest.mark.skipif(_NO_DATA, reason="data/raw is not populated")(
+        pytest.mark.heavy(fn)
+    )
+
 
 
 @pytest.fixture(scope="module")

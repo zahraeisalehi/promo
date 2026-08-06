@@ -7,3 +7,4 @@ data/out/
 data/raw/*.csv
 .claude/settings.local.json
 .env
+.tmp/

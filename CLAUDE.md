@@ -77,9 +77,30 @@ data/out/     what the app reads
 scratch/      exploration, gitignored
 ```
 
+## Test discipline
+
+This machine cannot afford the full suite as a routine check. Several tests load
+multi-hundred-megabyte parquet artefacts, and running them after every edit is
+what makes the loop slow.
+
+- **During task work, run only the tests for the module being edited:**
+  `pytest -q tests/test_<module>.py`. Do not run the full suite to check a
+  change.
+- **The full suite runs once, at the end of a phase.**
+- **Any test that reads a parquet from `data/interim/` must be marked
+  `@pytest.mark.heavy`**, so the default run can exclude them with
+  `-m "not heavy"`.
+- The `heavy` marker is registered in `pytest.ini`. A new marker must be
+  registered there before use, or pytest warns and the filter silently matches
+  nothing.
+
+A test that needs a large artefact is not a worse test — it is the one that
+catches real-data bugs. It just does not belong in the inner loop.
+
 ## Conventions
 
-- Python 3.11+, pandas, venv at `.venv`. Tests: `pytest -q`.
+- Python 3.11+, pandas, venv at `.venv`. Tests: `pytest -q -m "not heavy"` for
+  the fast pass, `pytest -q` at a phase boundary.
 - Every stage function returns `(DataFrame, dict)` — data plus diagnostics. Diagnostics are returned, never printed.
 - Gate failures return a `GateResult` from `promo/gates.py`, never raise.
 - Randomness takes an explicit `seed` and uses `np.random.default_rng`. No global seeding.

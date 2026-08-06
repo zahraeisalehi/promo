@@ -27,9 +27,20 @@ from promo.prices import (
 
 CLEAN = Path("data/interim/transactions_clean.parquet")
 
-real_data = pytest.mark.skipif(
-    not CLEAN.exists(), reason="run Task 2.2 first to build the cleaned parquet"
-)
+_NO_DATA = not CLEAN.exists()
+
+
+def real_data(fn):
+    """Marks a test that reads a real artefact from data/interim.
+
+    Heavy by definition — see "Test discipline" in CLAUDE.md — so the fast
+    pass excludes it with -m "not heavy", and it is skipped outright when
+    the artefact is absent.
+    """
+    return pytest.mark.skipif(_NO_DATA, reason="run Task 2.2 first to build the cleaned parquet")(
+        pytest.mark.heavy(fn)
+    )
+
 
 
 def _rows(records: list[dict]) -> pd.DataFrame:
