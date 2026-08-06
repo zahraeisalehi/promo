@@ -1259,3 +1259,96 @@ future information and the plan asks for them, so they are built — but the
 diagnostics tag every feature `lagged` or `contemporaneous`, and Phase 3 should
 report the estimate with and without the contemporaneous block rather than
 assume the controls are innocent.
+
+---
+
+## Task 2.7 — Availability, zero states, and the horizon that is longer than we said
+
+Reproduce: `promo.quality`; results in `data/interim/quality.json` and
+`data/interim/repurchase_cycles.parquet`.
+
+Task 1.5's figures reproduce exactly: **51.38%** raw no-trip share, **44.57%**
+within-span, median first week 11, median last week 101, and the top-8
+commodity gap table to the decimal.
+
+### Finding: the "3 week" horizon is the fastest categories, not the typical one
+
+Task 1.5's summary reads "the median repurchase cycle across the top 50
+commodities is 3 weeks, which is the floor for any measurement horizon", and
+consequence 3 gives "3 weeks for a typical category, 5 for slow ones". Computed
+on the basis Task 1.5 itself argued for — the **median of household medians**,
+because the pooled median is dominated by frequent buyers — that understates
+the typical category by half:
+
+| basis | median horizon |
+|---|---:|
+| top 50 commodities | **6 weeks** |
+| all 306 commodities | 9 weeks |
+| p90 across commodities | 16 weeks |
+| slowest with adequate support (`SEASONAL`) | 49 weeks |
+
+3 weeks is right for `FLUID MILK PRODUCTS`, `SOFT DRINKS` and
+`BAKED BREAD/BUNS/ROLLS` — the three fastest. It is wrong for the median
+top-50 category, which needs **6**. A single global 3-week window would bank the
+peak and miss the trough for most of the catalogue, which is precisely the
+failure the horizon rule exists to prevent.
+
+**The per-commodity horizon in `repurchase_cycles.parquet` is the number to
+use.** 298 of 306 commodities have one; 36 are flagged `low_support` (fewer than
+30 gap observations) and 8 have no gap at all and get no invented horizon.
+
+### The single-week share was also quoted on a partial basis
+
+Task 1.5's 15.53% of household-commodity pairs buying in exactly one week is the
+**top-50** figure (reproduced here as 15.60%). Across all 306 commodities it is
+**31.49%** — the long tail is mostly one-off purchases. Both are now in the
+diagnostics under their own names. The bias direction is unchanged and, on the
+full basis, twice as strong: every horizon is a floor.
+
+### Finding: a fuel-only visit is still a trip
+
+The shopping flag counts **any** transaction, not any *usable* one. Task 2.2's
+`usable` filter removes fuel and zero-quantity rows because they are not
+comparable demand — but a household that bought only petrol was in the shop and
+able to buy groceries. Applying that filter here turns **2,827 real trips into
+no-trips** and pushes the raw no-trip share from 51.38% to 52.49%.
+
+The distinction matters because it changes what a zero means: for those 2,827
+household-weeks, not buying the commodity is a **decision**, not an absence.
+`usable_only=True` exists to measure the gap, not as an option worth taking.
+
+### Zero states: four, not two
+
+| state | zero kind | carries demand information |
+|---|---|---|
+| `bought` | — | — |
+| `no_buy_on_trip` | **sampling** | **yes** |
+| `no_trip` | structural | no |
+| `out_of_panel` | structural | no — not even an observation |
+
+`out_of_panel` is kept separate from `no_trip` because a household not yet
+recruited is a different object from one who shopped elsewhere, and merging them
+hides the recruitment ramp. For `FLUID MILK PRODUCTS` the structural share of
+zeros is over 60%, matching Task 1.5.
+
+### The Phase 2 honesty report
+
+`data/interim/quality.json` consolidates all six stage diagnostics. It records
+**6 exclusions** with before-and-after row, unit, and sales-value effects:
+
+| stage | exclusion | action | rows |
+|---|---|---|---:|
+| clean | `nonpositive_quantity` | exclude | 14,466 |
+| clean | `unmatched_product` | exclude | 0 |
+| clean | `volume_measured` | exclude | 28,052 |
+| clean | `free_good` | flag | 4,451 |
+| clean | `blank_department` | flag | 7,839 |
+| prices | `retail_disc_surcharge` | exclude | 6 |
+
+It also carries the scope coverage, the `NO_MARGIN` finding, the treatment
+absence assumption, and four **unresolved** limits stated as limits: stockouts
+are unobservable; "not stocked" is indistinguishable from "stocked and unsold";
+the holiday flag has no calendar anchor; and 103,666 panel rows are unobserved
+rather than untreated and must never serve as controls. A stage whose
+diagnostics file is missing is named in `sources`, so the report can never be
+short without saying so.
