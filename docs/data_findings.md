@@ -44,9 +44,10 @@ total, and sales value, before and after.
 18–101 is where both hold. The window is fixed here, before any estimate is
 produced, rather than chosen after seeing results.
 
-**Still open**, and not part of this list — each is recorded in its own section:
+**Nothing from Phase 1 is still open.** The two items Task 1.4 left undecided —
 the `causal_data` duplicate-key resolution rule and the collapse-before-join
-requirement (Task 1.4).
+requirement — were both resolved in Task 2.5 and are recorded as settled
+decision 7 below.
 
 **Closed since Phase 1:** the price level test owed by Task 1.3 was run in Task
 2.3 and **confirms decision 3** — reconstruction A is closer to the observed
@@ -88,6 +89,58 @@ What the threshold costs, and why it is affordable:
 justification: the refusal is wide in the catalogue and narrow in revenue, which
 is the correct shape for a long-tail exclusion. 19 of the thin products have no
 reconstructable price at all and are a subset of this status, not a fourth one.
+
+**Added in Task 2.5:** a seventh settled decision, closing both of Task 1.4's
+open items.
+
+| # | Decision | From |
+|---|---|---|
+| 7 | **Duplicate `causal_data` keys resolve by "any treated wins",** after collapsing to one row per key and before the join. | Task 2.5 |
+
+**On (7), the rationale is structural rather than conservative.** `causal_data`
+contains **zero** untreated rows — measured, not assumed, and asserted on every
+run. It is a treatment log, not a panel, so a row exists only because something
+was promoted. A `display = '0'` row is therefore present on account of its
+mailer, and its zero display field records *absence of relevance*, not absence
+of display. Reading it as evidence of no-display misreads the file.
+
+**The evidence, checked before the rule was adopted:**
+
+| | |
+|---|---:|
+| conflicting keys | 15,245 |
+| of which `display` disagrees | 15,208 |
+| zero-display conflict rows carrying a **real mailer** | **15,208 / 15,208 = 100.0000%** |
+| zero-display conflict rows with `mailer = '0'` too | **0** |
+| `display` conflicts that are real-code against real-code | **0** |
+| `mailer` conflicts that are real-code against real-code | 9 |
+
+Not one exception. Had a material share of those rows carried `mailer = '0'`
+they would have no reason to exist under this reading and the decision would
+have been reopened; none does. The nine real-vs-real `mailer` conflicts take the
+lexicographic max, which moves the recorded *code* only and never the boolean.
+
+**"First wins" was considered and rejected.** The `'0'` record appears first in
+the file **99.76%** of the time — a real code is first on only 37 of 15,245
+keys — so file order is not arbitrary. "First wins" would function as
+"untreated always wins" in disguise, stripping the treatment from 15,208 keys.
+
+**What the rule costs.** Only **614** of the 15,245 conflicting keys appear in
+the panel at all, so the three candidate rules differ by 614 rows — 0.026
+percentage points of the panel. The rule is recorded because it must be, not
+because it moves the number.
+
+| rule | treated product-store-weeks | of panel |
+|---|---:|---:|
+| **any treated wins** (chosen) | **236,689** | **10.07%** |
+| all must agree | 236,075 | 10.05% |
+| drop conflicts | 236,075 | 10.05% |
+
+**Collapse before join is executed and asserted.** `promo/treatment.py` collapses
+`causal_data` to one row per key in DuckDB — restricted by semi-join to keys the
+panel holds, so only ~483k of 36.8M rows are ever materialised — then joins with
+`validate="one_to_one"` and raises `CoverageError` if the row count moves. The
+615 silently duplicated keys Task 1.4 found in a naive join cannot recur.
 
 ---
 
@@ -772,22 +825,15 @@ structural reasons rather than sparsity:
 Both remain available as a separate household × week analysis, which is a
 different panel and an optional axis, not this one.
 
-### Open Phase 2 decisions arising from this task
+### Open Phase 2 decisions arising from this task — both closed in Task 2.5
 
-These are not yet decided. Each must be resolved and recorded before any treated
-share or lift estimate is quoted.
-
-1. **The 15,245 conflicting `causal_data` keys need an explicit resolution
-   rule.** Every duplicated product-store-week disagrees with itself — 15,208 on
-   `display`, in every case `'0'` against a real code. Choose the rule (any /
-   first / drop), state it, and record its effect on the treated share, since
-   different rules give different shares. The figures in this section used *any
-   treated wins* as a reporting expedient; that is not the decision.
-2. **The join must collapse `causal_data` to one row per key before merging.**
-   Joining the panel to raw `causal_data` produced 2,371,399 rows for 2,370,784
-   distinct product-store-weeks — 615 keys silently duplicated, each one
-   double-counting a product-store-week in every downstream share. Collapse
-   first, then join, and assert one row per key afterwards.
+1. ~~The 15,245 conflicting `causal_data` keys need an explicit resolution
+   rule.~~ **Resolved: any treated wins**, on the structural grounds recorded as
+   settled decision 7. The *any treated wins* figures used for reporting in this
+   section are therefore now the decision as well, which was not knowable when
+   they were written.
+2. ~~The join must collapse `causal_data` to one row per key before merging.~~
+   **Done and asserted** in `promo/treatment.py`; see settled decision 7.
 
 ---
 
@@ -1041,3 +1087,74 @@ alongside the nominal columns and overwrites neither: Phase 5 accounting is in
 the currency the shopper actually paid, and only cross-week price *comparisons*
 use real terms. Depth is a within-week ratio, so the index cancels and depth
 needs no real counterpart — asserted in the tests rather than assumed.
+
+---
+
+## Task 2.5 — The treatment join, and what "untreated" is allowed to mean
+
+Reproduce: `promo.treatment.build_treatment_panel()`; the full result is in
+`data/interim/treatment_diagnostics.json`, the panel in
+`data/interim/panel_treated.parquet`.
+
+The duplicate-key rule and the collapse requirement are recorded above as
+settled decision 7. This section records what the join produced.
+
+### The treated share
+
+Treatment is `display` per settled decision 4, taken as a parameter rather than
+hardcoded so Phase 3 can re-run the audit under `mailer`, `display_or_mailer`,
+and `display_and_mailer`.
+
+| | rows | share of panel | units | sales value |
+|---|---:|---:|---:|---:|
+| in `causal_data` | 482,672 | 20.54% | 794,587 | 1,557,644 |
+| **treated (`display`)** | **236,689** | **10.07%** | 382,440 | 724,374 |
+| in mailer | 349,814 | 14.89% | | |
+| both mechanics | 103,831 | 4.42% | | |
+
+Treated is **49.04%** of the rows the log covers and **10.54%** of the rows
+where absence is informative. Both denominators are reported because the second
+is the one a treated share should be quoted against, and they differ by a factor
+of five.
+
+### The finding: absence means two different things, and only one is a control
+
+The plan's phrasing — "weeks and product-stores absent from `causal_data` are
+untreated, not missing" — is right inside the log's coverage and wrong outside
+it. `causal_data` spans weeks 9–101 and 115 stores. Inside that envelope a
+missing key is a real negative, because the log records every promotion. Outside
+it the log is simply silent, and calling silence "untreated" manufactures
+controls out of nothing.
+
+The panel therefore carries `treatment_observed` beside `treated`:
+
+| | rows | share | what it is |
+|---|---:|---:|---|
+| in the log | 482,672 | 20.54% | treatment read directly |
+| untreated by inference | 1,763,222 | **75.04%** | inside the envelope, absent from the log — a real negative |
+| **unobserved** | **103,666** | **4.41%** | outside the envelope — absence carries no information |
+
+**Three quarters of the panel is untreated by inference.** That is the
+assumption's true weight, and it is exactly why the 4.41% must be separable
+rather than folded in with it.
+
+**Consequence for Phase 3.** Controls must be drawn from `treatment_observed`
+rows only. An unobserved row used as an untreated control is a fabricated
+comparison, and at 103,666 rows it is large enough to matter and small enough to
+go unnoticed.
+
+### Store coverage is far better than the store count suggests
+
+Task 1.4 recorded that `causal_data` reaches 115 of 582 stores — **19.76%** —
+which reads like a severe limitation. At panel grain it is not:
+
+| | rows | sales value | share of sales |
+|---|---:|---:|---:|
+| the 115 logged stores | 2,313,740 | 7,285,564 | **98.54%** |
+| the other 441 stores | 35,820 | 107,681 | 1.46% |
+
+**The logged stores are the large ones: a fifth of the estate carrying 98.5% of
+the money.** The 4.41% unobserved share decomposes into 35,820 rows from
+unlogged stores and 67,846 rows in logged stores but outside weeks 9–101 —
+summing exactly. Quote the sales share, not the store count; the store count
+understates coverage by a factor of five and invites a needless refusal.
