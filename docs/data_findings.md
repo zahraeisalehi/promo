@@ -296,6 +296,56 @@ consequences of the promotion. Two modelling choices, four cells, settled by
 recovery against a known truth rather than by argument. The obligation is
 written into Task 4.4's **Done when** in `docs/plan.md`.
 
+**Added in Task 4.3:** an eleventh settled decision, on which cells a campaign
+is made of.
+
+| # | Decision | From |
+|---|---|---|
+| 11 | **A product-store belongs to a campaign if it was treated in *any* of the campaign weeks, and thereafter every week of the measurement window counts for that cell** — including campaign weeks its own display was down. | Task 4.3 |
+
+**On (11): the alternative was to count only the weeks each cell was actually
+treated.** That rule is tighter and it is wrong for this estimand. A display
+that ran two of four weeks still pulls demand forward, and the dip that follows
+is attributable to it — but it lands in weeks that cell was untreated, so the
+tighter rule drops exactly the observations the horizon rule exists to capture.
+It would bank each cell's peak and discard its trough, which is settled decision
+5's error committed one cell at a time instead of one campaign at a time.
+Carryover inside the window has the same shape: a store whose display came down
+in week 3 has not returned to baseline by week 3.
+
+**What it costs, and the cost is not small.** Exposure inside a campaign window
+is very uneven. Across every product-store treated in weeks 80–83:
+
+| weeks treated | cells | share |
+|---:|---:|---:|
+| 1 | 2,750 | **43.9%** |
+| 2 | 1,337 | 21.3% |
+| 3 | 999 | 15.9% |
+| 4 | 1,185 | 18.9% |
+
+Nearly half of all treated cells ran for a single week of the four, and fewer
+than one in five ran throughout. Under this rule **a cell treated once carries
+the same window weight as a cell treated four times.** The reported figure is
+therefore a **campaign-level average over uneven exposure, not a per-week dose
+response**, and it must never be read as "what a week of display does". A
+campaign whose cells mostly ran once will report a smaller per-cell effect than
+one whose cells all ran throughout, with no difference in the underlying
+response.
+
+`estimate_lift` records `treated_share_of_campaign_weeks` for exactly this
+reason — the share of campaign-window pair-weeks that were actually treated.
+On the carbonated-water campaign above it is **0.74**, so a quarter of the
+window's pair-weeks are counted-but-untreated. A reader who sees that number
+knows how much averaging sits behind the estimate; a reader who does not, does
+not.
+
+**Task 4.4 owes a check on this.** The synthetic harness can generate uneven
+exposure directly — cells treated for one, two, three, and four weeks of the
+same campaign, against a known per-week effect — and report whether recovery of
+the campaign-level truth is biased by the rule and in which direction. If it is,
+the fix is a stated weighting, not a quiet change to which cells count. Recorded
+in Task 4.4's section in `docs/plan.md`.
+
 ---
 
 ## Task 1.1 — Shape and coverage

@@ -401,6 +401,20 @@ Recovery against a known truth is what decides both. A cell that recovers τ wit
 less bias wins on evidence, and the result is recorded as a settled decision
 rather than as a preference.
 
+### It also owes a check on uneven exposure
+
+Settled decision 11 (Task 4.3) puts a product-store in a campaign if it was
+treated in **any** campaign week, and then counts every window week for it.
+Across the panel **43.9%** of cells treated in weeks 80–83 ran for one week of
+the four and only **18.9%** ran throughout, so a cell treated once carries the
+same window weight as a cell treated four times.
+
+The generator can produce that directly: cells treated for one, two, three, and
+four weeks of the same campaign, against a known per-week effect. **Report
+whether recovery of the campaign-level truth is biased by the rule, and in which
+direction.** If it is, the fix is a stated weighting — not a quiet change to
+which cells count, which would re-open a settled decision by implementation.
+
 ### Task 4.5 — Placebo
 
 > **Prompt:** Write `promo/validate.py` with a placebo harness over at least 300 never-treated windows. Return the distribution and a helper that flags whether a given estimate falls inside it.
@@ -416,7 +430,7 @@ Its message carries this project's sharpest distinction and there is already a
 test asserting the wording: an estimate inside the band means **this comparison
 cannot see the effect**, never that the promotion had none.
 
-**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, **the identity and contemporaneous-block cells of Task 4.4's two-by-two are reported and each choice is recorded as settled by recovery**, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
+**Done when:** the τ=0 synthetic case recovers approximately zero, the placebo band is computed and stored, every reported lift carries an interval and its placebo comparison, **the identity and contemporaneous-block cells of Task 4.4's two-by-two are reported and each choice is recorded as settled by recovery**, **the uneven-exposure check on settled decision 11 is reported with its bias direction**, and **`PLACEBO_OVERLAP` fires in a test through `run_audit()`** — the Phase 3 gate that Task 4.5 owes.
 
 ---
 
