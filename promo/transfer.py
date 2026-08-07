@@ -56,6 +56,7 @@ __all__ = [
     "MassConservationError",
     "TransferResult",
     "build_transfer_matrix",
+    "decompose",
     "write_diagnostics",
 ]
 
@@ -320,6 +321,114 @@ def build_transfer_matrix(
         ),
     }
     return TransferResult(matrix, gains, losses, metadata)
+
+
+def decompose(
+    transfer: TransferResult,
+    expansion: pd.Series | dict[int, float],
+    *,
+    tolerance: float = CONSERVATION_TOLERANCE,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """`delta_q = s + (g - l)`, per product, with the three terms kept apart.
+
+    `s` is expansion, and it comes from the **Phase 4 counterfactual** — not
+    from the transfer matrix. `g` and `l` are the matrix's row and column sums.
+    They arrive from different machinery and are **added**.
+
+    **Nothing here subtracts cannibalisation from a lift.** The temptation is to
+    write `delta_q = lift - cannibalisation`, and it double-counts: the
+    redistribution term is already signed, so subtracting it removes the units
+    twice. `g` and `l` enter as `+g` and `-l`, which is the same arithmetic done
+    once. A test asserts no code path does it the other way.
+
+    **The identity is per product, and that is what makes it informative.** A
+    promoted product has `g > 0` and `l ≈ 0`; a substitute has `g = 0` and
+    `l > 0`. Summed across the commodity the redistribution term cancels — mass
+    conservation guarantees `sum(g) == sum(l)` — so **the category-level change
+    is pure expansion**. A promotion that only moved units between shelves
+    shows a large per-product `delta_q` and a category total of about zero, and
+    that contrast is the whole output.
+
+    Args:
+        transfer: the matrix from `build_transfer_matrix`.
+        expansion: `s` per product, from Phase 4. Products absent from it get
+            `s = 0`, recorded as `expansion_estimated = False` — substitutes
+            have no counterfactual fitted, and a zero there is an absence of an
+            estimate rather than an estimate of no expansion.
+
+    Returns:
+        `(per_product, diagnostics)`.
+
+    Raises:
+        MassConservationError: the matrix does not conserve mass, so the
+            category-level cancellation would not hold either.
+    """
+    s_values = (
+        expansion if isinstance(expansion, pd.Series) else pd.Series(expansion, dtype="float64")
+    )
+    gains, losses = transfer.gains, transfer.losses
+
+    total_g = float(gains.sum())
+    total_l = float(losses.sum())
+    if abs(total_g - total_l) > tolerance:
+        raise MassConservationError(
+            f"the matrix does not conserve mass: gains {total_g:,.6f} against "
+            f"losses {total_l:,.6f}. The category-level cancellation in "
+            f"delta_q = s + (g - l) depends on it, so the decomposition would "
+            f"be wrong in a way that looks like a finding."
+        )
+
+    products = sorted(
+        set(gains.index) | set(losses.index) | set(s_values.index)
+    )
+    frame = pd.DataFrame(index=pd.Index(products, name="PRODUCT_ID"))
+    frame["s_expansion"] = [float(s_values.get(p, 0.0)) for p in products]
+    frame["expansion_estimated"] = [p in s_values.index for p in products]
+    frame["g_gained"] = [float(gains.get(p, 0.0)) for p in products]
+    frame["l_lost"] = [float(losses.get(p, 0.0)) for p in products]
+    frame["redistribution"] = frame["g_gained"] - frame["l_lost"]
+    # Added. Never `lift - cannibalisation`: see the docstring.
+    frame["delta_q"] = frame["s_expansion"] + frame["redistribution"]
+    frame = frame.reset_index()
+
+    category_redistribution = float(frame["redistribution"].sum())
+    category_expansion = float(frame["s_expansion"].sum())
+    category_delta_q = float(frame["delta_q"].sum())
+
+    diagnostics = {
+        "stage": "decompose",
+        "identity": "delta_q = s + (g - l)",
+        "products": len(frame),
+        "expansion_total": round(category_expansion, 6),
+        "gained_total": round(total_g, 6),
+        "lost_total": round(total_l, 6),
+        "redistribution_total": round(category_redistribution, 6),
+        "delta_q_total": round(category_delta_q, 6),
+        "products_with_estimated_expansion": int(frame["expansion_estimated"].sum()),
+        "redistribution_cancels": abs(category_redistribution) <= tolerance,
+        "why_it_cancels": (
+            "Mass conservation makes sum(g) equal sum(l), so the redistribution "
+            "term sums to zero across the commodity and the category-level "
+            "change is pure expansion. A promotion that only moved units "
+            "between shelves shows large per-product delta_q and a category "
+            "total near zero."
+        ),
+        "added_never_subtracted": (
+            "s comes from the Phase 4 counterfactual and (g - l) from the "
+            "transfer matrix. They are added. Writing "
+            "delta_q = lift - cannibalisation double-counts, because the "
+            "redistribution term is already signed."
+        ),
+        "expansion_absent_is_not_zero_expansion": (
+            "Products with no Phase 4 estimate carry s = 0 and "
+            "expansion_estimated = False. No counterfactual is fitted for a "
+            "substitute, so that zero is a missing estimate, not an estimate "
+            "of no expansion."
+        ),
+        "cell_split": transfer.metadata.get("cell_split"),
+        "mass_conservation": transfer.metadata.get("mass_conservation"),
+    }
+    return frame, diagnostics
 
 
 def _empty_result(

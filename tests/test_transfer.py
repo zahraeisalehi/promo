@@ -22,6 +22,7 @@ from promo.transfer import (
     CONSERVATION_TOLERANCE,
     MassConservationError,
     build_transfer_matrix,
+    decompose,
     write_diagnostics,
 )
 
@@ -292,3 +293,99 @@ def test_a_real_campaign_conserves_mass():
     assert result.metadata["household_commodities_examined"] > 0
     # Whatever the number, gains and losses agree — that is the invariant.
     assert result.gains.sum() == pytest.approx(result.losses.sum())
+
+
+# --- Task 6.2: the decomposition ----------------------------------------------
+
+
+def _decomposed(expansion: dict[int, float] | None = None):
+    result = build_transfer_matrix((PROMOTED,), WEEKS, _switcher(), pre_weeks=PRE_WEEKS)
+    return decompose(result, expansion if expansion is not None else {PROMOTED: 10.0})
+
+
+def test_delta_q_is_expansion_plus_redistribution():
+    frame, diag = _decomposed()
+
+    promoted = frame[frame.PRODUCT_ID == PROMOTED].iloc[0]
+    # 10 units of new demand, 4 taken from the substitute, nothing given up.
+    assert promoted["s_expansion"] == pytest.approx(10.0)
+    assert promoted["g_gained"] == pytest.approx(4.0)
+    assert promoted["l_lost"] == pytest.approx(0.0)
+    assert promoted["delta_q"] == pytest.approx(14.0)
+
+    substitute = frame[frame.PRODUCT_ID == SUBSTITUTE].iloc[0]
+    assert substitute["s_expansion"] == pytest.approx(0.0)
+    assert substitute["l_lost"] == pytest.approx(4.0)
+    assert substitute["delta_q"] == pytest.approx(-4.0)
+
+    assert diag["identity"] == "delta_q = s + (g - l)"
+
+
+def test_redistribution_cancels_so_the_category_change_is_pure_expansion():
+    """The contrast the whole output exists to show."""
+    frame, diag = _decomposed()
+
+    assert diag["redistribution_total"] == pytest.approx(0.0)
+    assert diag["redistribution_cancels"] is True
+    assert diag["delta_q_total"] == pytest.approx(diag["expansion_total"])
+    assert float(frame["delta_q"].sum()) == pytest.approx(10.0)
+
+
+def test_a_promotion_that_only_moved_units_shows_a_category_total_of_zero():
+    """No expansion at all: every unit gained came off another shelf."""
+    frame, diag = _decomposed(expansion={PROMOTED: 0.0})
+
+    assert frame.loc[frame.PRODUCT_ID == PROMOTED, "delta_q"].iloc[0] == pytest.approx(4.0)
+    assert frame.loc[frame.PRODUCT_ID == SUBSTITUTE, "delta_q"].iloc[0] == pytest.approx(-4.0)
+    assert diag["delta_q_total"] == pytest.approx(0.0)
+    assert diag["expansion_total"] == pytest.approx(0.0)
+
+
+def test_cannibalisation_is_never_subtracted_from_the_lift():
+    """The error CLAUDE.md names, asserted rather than trusted.
+
+    The wrong arithmetic is `delta_q = s - (g - l)`, or `lift - cannibalisation`.
+    With a gain of 4 and no loss it gives 6 where the identity gives 14, so the
+    two are distinguishable by value and this fails loudly if a path flips it.
+    """
+    frame, _ = _decomposed(expansion={PROMOTED: 10.0})
+    promoted = frame[frame.PRODUCT_ID == PROMOTED].iloc[0]
+
+    s, g, ell = promoted["s_expansion"], promoted["g_gained"], promoted["l_lost"]
+    assert promoted["delta_q"] == pytest.approx(s + (g - ell))
+    assert promoted["delta_q"] != pytest.approx(s - (g - ell))
+    assert promoted["delta_q"] != pytest.approx(s - g)
+
+    from promo import transfer as module
+
+    assert "double-count" in module.decompose.__doc__
+    source = Path(module.__file__).read_text()
+    assert 's_expansion"] + frame["redistribution"]' in source
+    assert 's_expansion"] - frame["redistribution"]' not in source
+
+
+def test_a_missing_expansion_estimate_is_flagged_not_read_as_zero_expansion():
+    frame, diag = _decomposed()
+
+    assert not frame[frame.PRODUCT_ID == SUBSTITUTE].iloc[0]["expansion_estimated"]
+    assert frame[frame.PRODUCT_ID == PROMOTED].iloc[0]["expansion_estimated"]
+    assert diag["products_with_estimated_expansion"] == 1
+    assert "missing estimate, not an estimate of no expansion" in (
+        diag["expansion_absent_is_not_zero_expansion"]
+    )
+
+
+def test_a_matrix_that_lost_mass_refuses_to_decompose():
+    """The cancellation depends on conservation, so it is checked again here."""
+    result = build_transfer_matrix((PROMOTED,), WEEKS, _switcher(), pre_weeks=PRE_WEEKS)
+    result.losses = result.losses * 2.0     # break it after the fact
+
+    with pytest.raises(MassConservationError, match="does not conserve mass"):
+        decompose(result, {PROMOTED: 10.0})
+
+
+def test_the_decomposition_carries_the_convention_label_forward():
+    """A reader of the decomposition must still know the cells are a convention."""
+    _, diag = _decomposed()
+    assert "convention" in diag["cell_split"]
+    assert diag["mass_conservation"]["asserted"] is True

@@ -48,10 +48,15 @@ from promo.io import connect
 
 __all__ = [
     "MARGIN_GRID",
+    "MARGIN_REQUIRING_FIGURES",
+    "MARGIN_SOURCES",
     "MECHANICS",
     "UnpricedFreeGoodsError",
+    "UnstampedMarginError",
     "adjust_lift_for_free_goods",
+    "assert_margin_stamped",
     "breakeven_margin",
+    "campaign_accounting",
     "free_goods",
     "free_goods_in_lift",
     "promo_cost",
@@ -59,6 +64,20 @@ __all__ = [
     "subsidy",
     "write_diagnostics",
 ]
+
+#: Where a margin came from. `"derived"` is unreachable on this dataset — no
+#: COGS column exists in any of the eight tables (`promo/io.py` establishes it
+#: at ingest) — and is present only so a future dataset carrying cost does not
+#: need the field invented.
+MARGIN_SOURCES: tuple[str | None, ...] = (None, "supplied", "derived")
+
+#: Figures that cannot exist without a margin. Every one of them lives inside a
+#: stamped container or not at all — see `stamp` in `campaign_accounting`.
+MARGIN_REQUIRING_FIGURES: tuple[str, ...] = (
+    "incremental_profit",
+    "roi",
+    "margin_headroom",
+)
 
 #: The assumed-margin grid, imported rather than restated. Task 5.2 is the
 #: authority on it and Task 3.4's kappa sweep uses the same nine points, so two
@@ -74,6 +93,16 @@ MECHANICS: dict[str, str] = {
 }
 
 _KEY = ("PRODUCT_ID", "STORE_ID", "WEEK_NO")
+
+
+class UnstampedMarginError(Exception):
+    """A margin-derived figure appeared without its provenance.
+
+    The failure this prevents is specific: a user types 30% into a box during a
+    demo, and four screens later a ranked list of returns looks like a
+    measurement. It is arithmetic conditional on a number the user made up, and
+    every figure carrying it must keep saying so.
+    """
 
 
 class UnpricedFreeGoodsError(Exception):
@@ -660,6 +689,186 @@ def sensitivity_table(
         ),
     }
     return table, diagnostics
+
+
+def assert_margin_stamped(payload: Any, *, _path: str = "") -> None:
+    """Every margin-derived figure carries its provenance, or this raises.
+
+    Walks a diagnostics structure and refuses any `MARGIN_REQUIRING_FIGURES`
+    key that is not inside a mapping also carrying `margin_source` and
+    `conditional_on_margin`. Called before serialisation, so a figure computed
+    from an assumed margin cannot leave the module naked.
+    """
+    if isinstance(payload, list):
+        for i, item in enumerate(payload):
+            assert_margin_stamped(item, _path=f"{_path}[{i}]")
+        return
+    if not isinstance(payload, dict):
+        return
+
+    derived = [k for k in MARGIN_REQUIRING_FIGURES if k in payload]
+    if derived:
+        stamped = (
+            "margin_source" in payload and "conditional_on_margin" in payload
+        )
+        if not stamped:
+            raise UnstampedMarginError(
+                f"{derived} appear at {_path or '<root>'} without "
+                f"margin_source and conditional_on_margin beside them. A figure "
+                f"computed from an assumed margin must carry the assumption "
+                f"wherever it is shown, or a reader four screens later mistakes "
+                f"arithmetic for a measurement."
+            )
+    for key, value in payload.items():
+        assert_margin_stamped(value, _path=f"{_path}.{key}" if _path else str(key))
+
+
+def campaign_accounting(
+    campaign: Any,
+    *,
+    gross_incremental: float,
+    interval: tuple[float, float] | None = None,
+    promoted_price: float | None = None,
+    margin: float | None = None,
+    margin_source: str | None = None,
+    transactions: str | Path | pd.DataFrame = "data/interim/transactions_clean.parquet",
+    prices: str | Path | pd.DataFrame = "data/interim/prices.parquet",
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """One campaign's whole accounting: cost, break-even, sensitivity, return.
+
+    Composes Task 5.1's cost and Task 5.2's ratio into the object a campaign
+    report needs, and applies Task 5.3's provenance rule to everything a margin
+    touches.
+
+    **The measured objects always ship.** The break-even margin and the
+    nine-column table are what the data establishes; a supplied margin never
+    replaces them, it only adds a conditional row beside them.
+
+    Args:
+        campaign: a `LiftCampaign`, or anything carrying `weeks`, and optionally
+            `product`/`products`, `stores`, `commodity`.
+        gross_incremental: the Phase 4 lift, in units. Adjust it for free goods
+            first — see `adjust_lift_for_free_goods`.
+        interval: the lift interval, which becomes the break-even interval.
+        promoted_price: revenue per incremental unit. Measured from the
+            campaign's own promoted weeks when omitted.
+        margin: an assumed gross margin. **None is the honest default on this
+            dataset** — there is no COGS column, so nothing derives it.
+        margin_source: `"supplied"` when a caller provides `margin`. Defaulted
+            for them rather than trusted, because the stamp is the point.
+
+    Returns:
+        `(sensitivity, diagnostics)`. Margin-derived figures live only inside
+        `diagnostics["conditional"]`, which carries the stamp — so the guarantee
+        is structural rather than a thing to remember.
+    """
+    if margin_source not in MARGIN_SOURCES:
+        raise ValueError(
+            f"margin_source must be one of {list(MARGIN_SOURCES)}, got "
+            f"{margin_source!r}"
+        )
+    if margin is not None and margin_source is None:
+        margin_source = "supplied"
+    if margin is None and margin_source == "supplied":
+        raise ValueError("margin_source='supplied' with no margin supplied")
+
+    products = getattr(campaign, "product_ids", None) or (
+        (campaign.product,) if getattr(campaign, "product", None) else None
+    )
+    weeks = tuple(campaign.weeks)
+    scope = {
+        "products": products,
+        "stores": getattr(campaign, "stores", None),
+        "weeks": weeks,
+        "commodity": getattr(campaign, "commodity", None),
+    }
+
+    own = con is None
+    con = connect() if con is None else con
+    try:
+        _, cost = promo_cost(transactions, prices, con=con, **scope)
+        if promoted_price is None:
+            src = _source(transactions, con, "_price_tx")
+            row = con.execute(
+                f"SELECT SUM(SALES_VALUE) AS v, SUM(QUANTITY) AS q FROM {src} "
+                f"WHERE usable AND ({_scope_sql(**scope)})"
+            ).fetchone()
+            con.unregister("_price_tx") if isinstance(transactions, pd.DataFrame) else None
+            promoted_price = float(row[0] / row[1]) if row and row[1] else 0.0
+    finally:
+        if own:
+            con.close()
+
+    total = cost["promo_cost_total"]
+    revenue = gross_incremental * promoted_price
+    revenue_interval = (
+        (interval[0] * promoted_price, interval[1] * promoted_price)
+        if interval is not None
+        else None
+    )
+    breakeven = breakeven_margin(total, revenue, interval=revenue_interval)
+    sensitivity, sensitivity_diag = sensitivity_table(
+        total, revenue, interval=revenue_interval
+    )
+
+    diagnostics: dict[str, Any] = {
+        "stage": "campaign_accounting",
+        "campaign": getattr(campaign, "name", None),
+        "scope": {k: (list(v) if isinstance(v, tuple) else v) for k, v in scope.items()},
+        "promoted_price": round(float(promoted_price), 6),
+        "incremental_units": round(float(gross_incremental), 6),
+        "incremental_revenue": round(float(revenue), 2),
+        "promo_cost": cost,
+        "breakeven": breakeven,
+        "sensitivity": sensitivity_diag,
+        "margin_source": margin_source,
+        "conditional_on_margin": margin,
+        "measured_objects_always_ship": (
+            "The break-even margin and the nine-column table are what the data "
+            "establishes and are present whether or not a margin was supplied. "
+            "A supplied margin adds a conditional figure beside them; it never "
+            "replaces them."
+        ),
+    }
+
+    if margin is None:
+        diagnostics["conditional"] = None
+        diagnostics["reason_code"] = "NO_MARGIN"
+        diagnostics["why_no_conditional"] = (
+            "No margin was supplied and none can be derived: no COGS or margin "
+            "column exists in any of the eight tables, established at ingest. "
+            "Profit and return are therefore not computed. The break-even "
+            "margin and the sensitivity table are the answer this dataset "
+            "supports, and a merchant reads their own margin off the table."
+        )
+    else:
+        profit = margin * revenue - total
+        diagnostics["conditional"] = {
+            # The stamp lives on the same mapping as the figures, so the
+            # guarantee holds by construction rather than by discipline.
+            "margin_source": margin_source,
+            "conditional_on_margin": margin,
+            "incremental_profit": round(float(profit), 2),
+            "roi": round(float(profit / total), 6) if total else None,
+            "margin_headroom": (
+                round(float(margin - breakeven["m_star"]), 6)
+                if breakeven["m_star"] is not None
+                else None
+            ),
+            "reads_as": (
+                f"at the {margin:.0%} margin you supplied, this campaign "
+                f"returned {profit:,.0f} in incremental profit"
+            ),
+            "not_a_measurement": (
+                "Arithmetic conditional on a number the user supplied. The "
+                "dataset carries no margin, so this figure is an assumption "
+                "applied to a measurement, not a measurement."
+            ),
+        }
+
+    assert_margin_stamped(diagnostics)
+    return sensitivity, diagnostics
 
 
 def write_diagnostics(diagnostics: dict[str, Any], path: str | Path) -> Path:

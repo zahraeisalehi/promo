@@ -18,10 +18,15 @@ import pytest
 
 from promo.accounting import (
     MARGIN_GRID,
+    MARGIN_REQUIRING_FIGURES,
+    MARGIN_SOURCES,
     MECHANICS,
     UnpricedFreeGoodsError,
+    UnstampedMarginError,
     adjust_lift_for_free_goods,
+    assert_margin_stamped,
     breakeven_margin,
+    campaign_accounting,
     free_goods,
     free_goods_in_lift,
     promo_cost,
@@ -393,3 +398,132 @@ def _panel_for_audit() -> pd.DataFrame:
             for w in range(1, 9)
         ]
     )
+
+
+# --- campaign_accounting: the three per-campaign objects ----------------------
+
+
+def _campaign():
+    from promo.lift import LiftCampaign
+
+    return LiftCampaign(name="demo", commodity="SOUP", product=1, weeks=(5, 5))
+
+
+def _tx() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"PRODUCT_ID": 1, "STORE_ID": 1, "WEEK_NO": 5, "QUANTITY": 100,
+             "SALES_VALUE": 200.0, "RETAIL_DISC": -40.0, "COUPON_DISC": 0.0,
+             "COUPON_MATCH_DISC": 0.0, "COMMODITY_DESC": "SOUP", "usable": True}
+        ]
+    )
+
+
+def _pr() -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"PRODUCT_ID": 1, "STORE_ID": 1, "WEEK_NO": 5, "regular_price": 3.0}]
+    )
+
+
+def _accounted(**kwargs):
+    return campaign_accounting(
+        _campaign(), gross_incremental=50.0, interval=(30.0, 70.0),
+        transactions=_tx(), prices=_pr(), **kwargs,
+    )
+
+
+def test_a_campaign_gets_a_breakeven_interval_a_table_and_a_verdict():
+    """Phase 5's first three conditions, in one object."""
+    table, diag = _accounted()
+
+    assert diag["breakeven"]["m_star"] is not None
+    assert diag["breakeven"]["m_star_interval"] is not None      # an interval
+    assert list(table["margin"]) == list(MARGIN_GRID)            # nine columns
+    assert len(table) == 9
+    assert diag["reason_code"] == "NO_MARGIN"                    # a stated refusal
+    assert diag["promo_cost"]["promo_cost_total"] == 40.0
+
+
+def test_an_unbounded_denominator_gives_a_stated_refusal_not_a_number():
+    _, diag = campaign_accounting(
+        _campaign(), gross_incremental=1.0, interval=(-50.0, 50.0),
+        transactions=_tx(), prices=_pr(),
+    )
+    assert diag["breakeven"]["m_star"] is None
+    assert diag["breakeven"]["reason_code"] == "ROI_UNBOUNDED"
+
+
+def test_the_price_comes_from_the_campaigns_own_promoted_weeks():
+    _, diag = _accounted()
+    assert diag["promoted_price"] == pytest.approx(2.0)          # 200.0 / 100
+    assert diag["incremental_revenue"] == pytest.approx(100.0)   # 50 x 2.00
+
+
+# --- Task 5.3: a supplied margin is an assumption and is labelled as one ------
+
+
+def test_without_a_margin_the_margin_figures_refuse_rather_than_guess():
+    _, diag = _accounted()
+
+    assert diag["conditional"] is None
+    assert diag["margin_source"] is None
+    assert diag["conditional_on_margin"] is None
+    assert diag["reason_code"] == "NO_MARGIN"
+    assert "no COGS or margin column exists" in diag["why_no_conditional"]
+
+
+def test_a_supplied_margin_is_stamped_on_every_figure_it_touches():
+    _, diag = _accounted(margin=0.30)
+    cond = diag["conditional"]
+
+    assert cond["margin_source"] == "supplied"
+    assert cond["conditional_on_margin"] == 0.30
+    for figure in MARGIN_REQUIRING_FIGURES:
+        assert figure in cond
+    assert cond["incremental_profit"] == pytest.approx(0.30 * 100.0 - 40.0)
+    assert "margin you supplied" in cond["reads_as"]
+    assert "not a measurement" in cond["not_a_measurement"].lower()
+
+
+def test_a_supplied_margin_never_replaces_the_measured_objects():
+    """Rule 1: break-even and the table are what the data establishes."""
+    table, diag = _accounted(margin=0.30)
+
+    assert diag["breakeven"]["m_star"] is not None
+    assert len(table) == 9
+    assert "never replaces them" in diag["measured_objects_always_ship"]
+
+
+def test_no_margin_derived_figure_can_be_serialised_without_its_stamp():
+    """The guarantee Task 5.3 asks for, enforced by shape.
+
+    Margin-derived figures live only inside the stamped container, so the check
+    passes by construction — and the checker is proven able to fail by handing
+    it a figure placed anywhere else.
+    """
+    _, diag = _accounted(margin=0.30)
+    assert_margin_stamped(diag)                    # the real object passes
+
+    naked = {"campaign": "demo", "summary": {"roi": 1.4}}
+    with pytest.raises(UnstampedMarginError, match="without margin_source"):
+        assert_margin_stamped(naked)
+
+    nested = {"campaigns": [{"incremental_profit": 10.0}]}
+    with pytest.raises(UnstampedMarginError):
+        assert_margin_stamped(nested)
+
+
+def test_derived_is_a_legal_source_but_unreachable_on_this_dataset():
+    """Present so a future dataset with COGS need not invent the field."""
+    assert MARGIN_SOURCES == (None, "supplied", "derived")
+
+    with pytest.raises(ValueError, match="margin_source must be one of"):
+        _accounted(margin=0.30, margin_source="guessed")
+    with pytest.raises(ValueError, match="no margin supplied"):
+        _accounted(margin_source="supplied")
+
+
+def test_a_margin_supplied_without_a_source_is_stamped_supplied_anyway():
+    """The stamp is the point, so it is defaulted rather than trusted."""
+    _, diag = _accounted(margin=0.25)
+    assert diag["conditional"]["margin_source"] == "supplied"
