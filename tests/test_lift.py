@@ -27,6 +27,7 @@ from promo.lift import (
     campaign_cells,
     estimate_lift,
     resolve_horizon,
+    uncompared_lift,
     write_diagnostics,
 )
 
@@ -634,3 +635,82 @@ def test_a_real_campaign_runs_end_to_end():
     assert lift["net_incremental"] == pytest.approx(
         lift["gross_incremental"] + lift["post_window_residual"], abs=1e-6
     )
+
+
+# --- the placebo comparison rides with the lift -------------------------------
+
+
+def _panel_with_controls(seed: int = 0) -> pd.DataFrame:
+    """The fixture panel plus never-treated cells, so a placebo pool exists.
+
+    `_panel` promotes every product-store, which is fine for measuring a lift
+    and leaves nothing for a band to be drawn from.
+    """
+    treated = _panel(seed=seed)
+    controls = _panel(seed=seed + 100, peak=0.0, trough=0.0)
+    controls["PRODUCT_ID"] = controls["PRODUCT_ID"] + 500
+    controls["treated"] = False
+    return pd.concat([treated, controls], ignore_index=True)
+
+
+def _band_for(panel: pd.DataFrame, seed: int = 0):
+    """A small band matched to the fixture campaign's shape."""
+    from promo.baseline import fit_baseline
+    from promo.validate import placebo_band
+
+    controls = panel.loc[~panel["treated"]].reset_index(drop=True)
+    model, _ = fit_baseline(
+        controls, features=FEATURES, week_range=None, n_estimators=40,
+        num_leaves=15, min_data_in_leaf=20, backtest_weeks=0, seed=seed,
+    )
+    draws, _ = placebo_band(
+        model, panel, n_cells=4, campaign_length=4, horizon_weeks=TROUGH_WEEKS,
+        n_windows=300, week_range=None, pool="never_treated", seed=seed,
+    )
+    return draws
+
+
+def test_a_supplied_placebo_band_is_compared_and_recorded():
+    panel = _panel_with_controls(seed=30)
+    draws = _band_for(panel, seed=30)
+    _, diag = _estimate(panel, seed=30, placebo=draws)
+
+    placebo = diag["placebo"]
+    assert placebo is not None
+    assert placebo["compared"] is True
+    assert isinstance(placebo["inside_band"], bool)
+    assert placebo["band_low"] < placebo["band_high"]
+    assert placebo["windows"] == 300
+    assert placebo["p_value"] is not None
+    assert "comparison" in placebo["meaning"] or "band" in placebo["meaning"]
+
+
+def test_without_a_band_the_placebo_key_is_null_not_absent():
+    """The absence of a check must not look like the check passing."""
+    panel = _panel(seed=31)
+    _, diag = _estimate(panel, seed=31)
+
+    assert "placebo" in diag          # the key is always there
+    assert diag["placebo"] is None    # and says plainly that nothing was done
+
+
+def test_an_uncompared_lift_is_detectable():
+    """The state this project exists to prevent, made machine-checkable.
+
+    A lift figure with no placebo comparison has not been shown to be
+    distinguishable from a week where nothing happened. `uncompared_lift`
+    spots it from the diagnostics alone, so a caller, a UI or a reviewer does
+    not have to read the code that produced the number.
+    """
+    panel = _panel_with_controls(seed=32)
+    _, uncompared = _estimate(panel, seed=32)
+    assert uncompared["lift"]["gross_incremental"] is not None
+    assert uncompared["placebo"] is None
+    assert uncompared_lift(uncompared) is True
+
+    _, compared = _estimate(panel, seed=32, placebo=_band_for(panel, seed=32))
+    assert uncompared_lift(compared) is False
+
+    # A dict with no lift at all is not an uncompared lift — there is nothing
+    # to have failed to compare.
+    assert uncompared_lift({"lift": {}, "placebo": None}) is False

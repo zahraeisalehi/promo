@@ -419,8 +419,14 @@ def test_without_an_estimate_the_gate_says_the_comparison_was_not_made():
 
 
 def test_the_placebo_gate_is_in_the_running_order():
+    """`placebo` sits after the model fit and before `roi`.
+
+    It needs an estimate and a 300-rollout band, so it cannot come earlier;
+    `roi` needs the cost total as well, so `placebo` cannot be last.
+    """
     assert "placebo" in GATE_ORDER
-    assert GATE_ORDER[-1] == "placebo"
+    assert GATE_ORDER[-1] == "roi"
+    assert GATE_ORDER[GATE_ORDER.index("placebo") + 1] == "roi"
 
 
 # --- the real panel -----------------------------------------------------------

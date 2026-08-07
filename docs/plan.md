@@ -664,6 +664,28 @@ user made up, and the system must keep saying so.
 
 ## Phase 6 — Cannibalisation (MVP 04)
 
+> **Phase 6 was started with Phase 5 open, deliberately and on record.**
+> `CLAUDE.md` says phases are sequential; this is a stated exception, not an
+> oversight. At the time Task 6.1 began, Phase 5's **Done when** had four unmet
+> conditions:
+>
+> - every campaign reporting a break-even **interval** — the function exists and
+>   is tested, but nothing composes it per campaign;
+> - the nine-column sensitivity table per campaign — same;
+> - an ROI interval or stated refusal per campaign — same;
+> - Task 5.3's margin provenance — `margin_source` and
+>   `conditional_on_margin` are absent from `promo/accounting.py` entirely.
+>
+> Met at that point: promotional cost as subsidy plus free goods with the split
+> and unpriced residual visible; `KAPPA_IMPOSSIBLE` above 50%; `ROI_UNBOUNDED`
+> firing through `run_audit()`.
+>
+> **Why it was safe to proceed.** Phase 6 reads baskets and the Phase 4
+> counterfactual. It does not import `promo/accounting.py`, so it cannot inherit
+> a Phase 5 defect. The blocker was the sequencing rule, not a dependency.
+> Anything that later multiplies a decomposition by a margin still owes the
+> Phase 5 stamps.
+
 You have BASKET_ID, so this is identified. Most teams working from store totals cannot do this at all.
 
 > **Prompt:** Write `promo/transfer.py`. Using baskets, for a promoted product identify households that purchased a substitute in the same COMMODITY_DESC in their pre-window trips and the promoted product during the window. Build T where T[i][j] is units moved from j to i. Assert mass conservation: row sums total equals column sums total. Return gains, losses, and the matrix, and label the cell-level split in the output metadata as a stated convention rather than an identified quantity.

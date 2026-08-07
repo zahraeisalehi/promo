@@ -67,6 +67,7 @@ __all__ = [
     "campaign_cells",
     "estimate_lift",
     "resolve_horizon",
+    "uncompared_lift",
     "write_diagnostics",
 ]
 
@@ -435,6 +436,7 @@ def estimate_lift(
     quantiles: tuple[float, float] | None = DEFAULT_QUANTILES,
     check_drift: bool = True,
     level: str = "campaign",
+    placebo: Any = None,
     outcome: str = "units",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Incremental units for one campaign, over a window that outlasts the cycle.
@@ -447,6 +449,11 @@ def estimate_lift(
         con: an existing DuckDB connection; one is opened and closed if omitted.
         quantiles: `(low, high)` counterfactual paths for the interval, or None
             for a point estimate only. Each is its own recursion.
+        placebo: draws or a band from `promo.validate.placebo_band`, matched to
+            this campaign's shape. Supplied, the comparison is attached to the
+            diagnostics; omitted, `diagnostics["placebo"]` is None with a note
+            saying no comparison was made — so its absence is visible rather
+            than reading like a pass.
         level: how to group the residuals into reported units — a key of
             `AGGREGATION_LEVELS`. The campaign total is the same at every
             level; what changes is how many cells back each reported number.
@@ -559,6 +566,16 @@ def estimate_lift(
         "stage": "estimate_lift",
         "campaign": campaign.model_dump(),
         "lift": lift,
+        # Always present, null when no band was supplied: the absence of a
+        # check has to look different from the check passing.
+        "placebo": _placebo_comparison(lift["gross_incremental"], placebo),
+        "placebo_note": (
+            "No placebo band was supplied, so this lift has not been shown to "
+            "be distinguishable from a window where nothing happened. "
+            "uncompared_lift() detects this state from the diagnostics alone."
+            if placebo is None
+            else "Compared against a band matched to this campaign's shape."
+        ),
         "by_level": level_diag,
         "horizon": horizon_diag,
         "cells": cells_diag,
@@ -671,6 +688,45 @@ def _aggregate(
             point["gross_incremental"], available_post_weeks
         )
     return lift
+
+
+def _placebo_comparison(gross: float, placebo: Any) -> dict[str, Any] | None:
+    """Attach the placebo verdict, or say plainly that none was made.
+
+    None rather than a cheerful default. A lift with no placebo comparison has
+    not been shown to be distinguishable from a week where nothing happened,
+    and the whole argument of this project is that the absence of a check must
+    look different from the check passing.
+    """
+    if placebo is None:
+        return None
+
+    from promo.validate import inside_band
+
+    inside, evidence = inside_band(gross, placebo)
+    return {
+        "compared": True,
+        "inside_band": inside,
+        "band_low": evidence["band_low"],
+        "band_high": evidence["band_high"],
+        "band_median": evidence["band_median"],
+        "windows": evidence["windows"],
+        "p_value": evidence.get("p_value"),
+        "meaning": evidence["meaning"],
+    }
+
+
+def uncompared_lift(diagnostics: dict[str, Any]) -> bool:
+    """Is this a lift figure that was never compared against a placebo band?
+
+    The state the project exists to prevent: a number that looks like a finding
+    because nothing contradicted it. Detectable by construction — a non-null
+    lift beside a null `placebo` — so a caller, a UI, or a reviewer can spot it
+    without reading the code that produced it.
+    """
+    lift = diagnostics.get("lift") or {}
+    has_lift = lift.get("gross_incremental") is not None
+    return bool(has_lift and diagnostics.get("placebo") is None)
 
 
 def aggregate_residuals(

@@ -359,10 +359,18 @@ def test_the_pipeline_stops_at_the_first_refusal() -> None:
 
 
 def test_gates_run_cheapest_first() -> None:
+    """Cheapest first, so a campaign failing on arithmetic never pays for a fit.
+
+    The tail order is the part that needs stating, because it is about
+    dependencies rather than cost. `overlap` fits a model. `placebo` needs an
+    estimate to already exist plus a band of at least 300 rollouts. `roi` is
+    last because it needs **both** the Task 5.1 cost total and the Phase 4
+    estimate — it cannot run until every other input exists.
+
+    Written out so the intent survives the next gate someone adds.
+    """
     assert GATE_ORDER[0] == "break_even"
-    # Arithmetic, then the model fit, then the placebo band — which needs both
-    # an estimate and 300 rollouts and so cannot come earlier.
-    assert GATE_ORDER[-2:] == ("overlap", "placebo")
+    assert GATE_ORDER[-3:] == ("overlap", "placebo", "roi")
 
 
 def test_stop_on_refuse_false_collects_every_verdict() -> None:
