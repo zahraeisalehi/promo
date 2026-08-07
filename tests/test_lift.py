@@ -19,8 +19,11 @@ import pytest
 
 from promo.baseline import add_price_history, fit_baseline
 from promo.lift import (
+    AGGREGATION_LEVELS,
     LiftCampaign,
     NoCellsError,
+    UnknownLevelError,
+    aggregate_residuals,
     campaign_cells,
     estimate_lift,
     resolve_horizon,
@@ -517,6 +520,71 @@ def test_drift_checking_can_be_turned_off():
     panel = _panel(seed=20)
     _, diag = _estimate(panel, seed=20, check_drift=False)
     assert diag["drift_check"] == {"ran": False, "why": "check_drift=False"}
+
+
+# --- aggregation levels -------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", sorted(AGGREGATION_LEVELS))
+def test_the_campaign_total_is_the_same_at_every_level(level: str):
+    """Grouping partitions the residuals; it cannot change their sum.
+
+    The invariant that makes level comparisons meaningful: if the total moved
+    with the level, a level would be choosing an answer rather than choosing how
+    to report one.
+    """
+    panel = _panel(seed=22)
+    _, diag = _estimate(panel, seed=22, level=level)
+
+    by_level = diag["by_level"]
+    assert by_level["level"] == level
+    assert by_level["gross_total"] == pytest.approx(
+        diag["lift"]["gross_incremental"], abs=1e-6
+    )
+    assert by_level["net_total"] == pytest.approx(
+        diag["lift"]["net_incremental"], abs=1e-6
+    )
+    assert by_level["cells_total"] == diag["cells"]["pairs"]
+
+
+def test_the_levels_split_the_same_cells_different_ways():
+    panel = _panel(seed=23)
+    counts = {}
+    for level in ("campaign", "commodity", "commodity_store", "cell"):
+        _, diag = _estimate(panel, seed=23, level=level)
+        counts[level] = diag["by_level"]["n_units"]
+
+    # One commodity in the fixture, so campaign and commodity coincide; below
+    # them the units multiply and each carries proportionally fewer cells.
+    assert counts["campaign"] == 1
+    assert counts["commodity"] == 1
+    assert counts["commodity_store"] == 10
+    assert counts["cell"] == N_PAIRS
+
+
+def test_each_unit_reports_the_cells_behind_it():
+    panel = _panel(seed=24)
+    _, diag = _estimate(panel, seed=24, level="commodity_store")
+    units = pd.DataFrame(diag["by_level"]["units"])
+
+    assert set(units["STORE_ID"]) == set(panel["STORE_ID"])
+    assert (units["cells"] == N_PAIRS / 10).all()
+    assert (units["cell_weeks"] == units["cells"] * WINDOW_WEEKS).all()
+    assert (units["mean_units_per_cell"] > 0).all()
+    assert np.allclose(units["net"], units["gross"] + units["post"])
+
+
+def test_an_unknown_level_is_refused_before_the_model_runs():
+    panel = _panel(seed=25)
+    with pytest.raises(UnknownLevelError, match="level must be one of"):
+        _estimate(panel, seed=25, level="store")
+
+
+def test_a_level_the_residuals_cannot_group_by_is_named():
+    panel = _panel(seed=26)
+    residuals, _ = _estimate(panel, seed=26)
+    with pytest.raises(KeyError, match="do not carry"):
+        aggregate_residuals(residuals.drop(columns=["COMMODITY_DESC"]), "commodity")
 
 
 def test_write_diagnostics_round_trips(tmp_path):

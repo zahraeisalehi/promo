@@ -2293,3 +2293,246 @@ trustworthy for being negative. The honest reading is that a 101-cell campaign
 on a product selling well under one unit per store-week does not carry enough
 signal for this method to resolve, at either model version. Task 4.5's placebo
 band is what turns that from a diagnostic into a refusal.
+
+---
+
+## Task 4.5 — where zero actually sits
+
+Reproduce: `promo.validate.band_for_campaign()`; draws in
+`data/interim/placebo_band.parquet` and the band in `placebo_band.json`.
+
+300 windows on never-treated product-stores, each **matched to the campaign's
+shape** — 101 cells, four promoted weeks, a six-week horizon. The truth in every
+window is zero.
+
+| | gross units |
+|---|---:|
+| p1 | −46.1 |
+| p5 (band low) | **−37.0** |
+| p25 | −22.2 |
+| **median** | **−10.5** |
+| p75 | −1.1 |
+| p95 (band high) | **+17.9** |
+| p99 | +31.7 |
+
+Band width **54.9 units** on a mean counterfactual of 120.3 — the central 90% of
+the null spans nearly half the counterfactual it is measured against. As a share
+of the counterfactual the band is **[−0.322, +0.134]**.
+
+**The runbook's line, measured: the band is not centred on zero.** Its median is
+**−10.5 units**, or −9.4% of the counterfactual. Zero sits at the 71st
+percentile of the null, and **76.3% of placebo draws come out negative**. That
+offset is the estimator's bias on windows where nothing happened, and it is the
+same quantity Task 4.3's drift check reports for a single window — here measured
+over 300 and therefore not attributable to one unlucky slice.
+
+**The drift grows with recursion depth, and it points the other way from the
+synthetic.** Per week it nearly doubles across the window — **−2.77 units/week
+over the four campaign weeks against −5.28 over the six post weeks, a factor of
+1.91** — which is the compounding signature Task 4.4 described. But the *sign*
+is opposite. On the synthetic panels the counterfactual came back **18–28% low**
+by week seven; on the real panel it comes back **10.1% high** (120.3 against
+109.2 observed). Same mechanism, inverted.
+
+**This is not explained and is recorded as open.** The obvious suspect is that
+the real panel is 87% zeros against the synthetic's 10–20%, so the rollout is
+mostly feeding predicted near-zeros back into cells that genuinely sell nothing,
+and the conditional mean of a Poisson fit on such a cell sits above the observed
+zeros it is averaged against. That is a hypothesis, not a measurement. What
+matters for anything downstream is the direction: **on this panel the
+counterfactual is biased high, so measured lift is biased low** — the reverse of
+what Task 4.4's synthetic figures would lead a reader to expect. Do not carry
+the synthetic's sign onto real estimates.
+
+### The bottled-water campaign is refused
+
+**These figures use the never-treated pool and predate the fix below.** The band
+was rebuilt on ever-treated cells after the two-nulls disagreement was found;
+the refusal verdict is unchanged but the band's edges are not these. Kept as the
+record of what the first band said.
+
+| | |
+|---|---:|
+| gross incremental | **−2.98** |
+| band (never-treated pool) | [−36.97, +17.92] |
+| band median | −10.53 |
+| percentile of the estimate | 71.3 |
+| two-sided p | **0.573** |
+| windows at least as extreme | 190 of 300 |
+
+`run_audit()` returns **`PLACEBO_OVERLAP`**, severity `refuse`, verdict *not
+identified*. More than half the placebo windows are further from the null's
+centre than the campaign is. This is the first end-to-end refusal driven by an
+estimate rather than by a data condition, and it agrees with what Task 4.3's
+drift check already said about the same campaign — two independent checks, the
+same verdict.
+
+**The message carries the distinction the project turns on** and a test asserts
+the wording: *"That is a statement about what this comparison can see, not
+evidence that the promotion did nothing."*
+
+### What this band is not
+
+- **Not a confidence interval on the effect.** It is the dispersion of the
+  estimator under a true zero. The quantile band that ships with a lift is the
+  model's own predictive uncertainty, and Task 4.4 recorded that as
+  uninformative here (coverage 1.00 against a nominal 0.80). The placebo band is
+  the one that carries information about whether an estimate can be seen, which
+  is why the gate keys on this and not on that.
+- **Not Task 4.3's drift check.** That rolls one window on the campaign's own
+  cells immediately before it ran; this rolls hundreds on cells that were never
+  promoted. Specific versus general, and an estimate should clear both.
+- **Not out-of-sample.** The baseline trains on every `treated == 0` row,
+  which includes these never-treated cells, so the model has seen them. **The
+  band is therefore optimistic** — one drawn on unseen cells would be wider, and
+  the dispersion on a genuinely new campaign wider still. Recorded rather than
+  corrected: correcting it needs a held-out fit.
+
+### Free goods reach the lift numerator, and the fix is deferred on purpose
+
+**85 giveaway units across 78 treated product-store-weeks are counted twice** —
+as promotional cost by `promo/accounting.py` and as incremental demand by the
+Phase 4 lift. The same unit on both sides of a ratio inflates ROI from both
+ends. `free_goods_in_lift()` measures it and returns `CONTAMINATED`.
+
+**The structural fix belongs in `clean.py`'s definition of `usable`**, which is
+what decides whether a giveaway row's units flow into the Phase 2.6 panel. It
+is **deferred**, because changing it means rebuilding the panel and refitting
+the baseline, and the contamination is **1.9% of free-goods units and 0.02% of
+promotional cost**. That ratio does not justify invalidating every downstream
+figure.
+
+**The reporting-time correction is exact, not approximate.**
+`adjust_lift_for_free_goods()` subtracts the contaminated units from the lift
+numerator wherever a lift or ROI figure is shown. The units are identified
+individually by key and week — they are the giveaway rows that join the panel in
+treated weeks — so the subtraction removes precisely the double-counted
+quantity, with no estimation and no residual. It is a correction at the point of
+reporting rather than in the model, which is a weaker place to fix it and an
+exact one nonetheless.
+
+`free_goods_in_lift()` keeps returning `CONTAMINATED` until the structural fix
+lands, so the deferral stays visible rather than being closed by the workaround.
+
+### The two nulls disagree, and neither population nor period explains it
+
+**Stop here.** Two independent nulls for the same campaign point in opposite
+directions, three hypotheses were tested, and none of them accounts for it.
+
+The nulls are Task 4.3's `drift_check` — the estimator rolled over the
+campaign's **own cells** in the weeks immediately before it ran — and Task 4.5's
+placebo band. Both estimate the same thing: what this estimator returns when
+nothing happened. On the five densest commodities with treatment in weeks 80–83
+they disagree in **sign**:
+
+| band drawn from | signs agreeing with own-cell drift |
+|---|:--:|
+| never-treated cells, starts across the panel | **1 / 5** |
+| ever-treated cells in untreated weeks | **1 / 5** |
+| ever-treated cells, starts restricted to weeks 74–79 | **1 / 5** |
+
+Cheese is the one that agrees, in all three. The other four have a positive
+own-cell drift (+82 to +286 units) against a band median that is negative under
+every construction (−28 to −199).
+
+**What was tested and ruled out.**
+
+1. **Population mismatch.** Task 3.2 separates promoted from unpromoted cells at
+   AUC 0.70, so a null measured on never-treated cells is measured on a
+   different population. Plausible, and wrong: switching the pool to
+   ever-treated cells left agreement at 1/5 and *widened* the gap — the
+   own-minus-band difference grew from (104, 400, 152, −59, 195) to
+   (117, 485, 194, −24, 206).
+2. **Period mismatch.** The placebo averages window starts across the panel; the
+   drift check uses each campaign's own pre-period. Restricting starts to weeks
+   74–79 moved the milk median only from −34.3 to −28.5, against the ~117 needed
+   to reconcile. Agreement stayed at 1/5.
+3. **Scale mismatch.** Ruled out by construction: every band is size-matched to
+   its campaign's cell count, campaign length and horizon.
+
+**What remains unexplained.** The residual difference is between *these
+particular cells in this particular window* and any comparable set of cells in
+any comparable window. Something about the cells a retailer chose to promote in
+weeks 80–83 makes the estimator behave differently on them than on matched cells
+elsewhere — and that is precisely the thing a placebo band is supposed to
+control for. Candidates not tested: selection on promotion *timing* rather than
+on promotion at all; a commodity-specific interaction; or the drift check's
+single window being too noisy at n=1 to compare against a 300-window band.
+
+**The consequence, and it is a refusal.** When two nulls for the same quantity
+disagree about its sign, neither can be trusted to say whether an estimate
+clears it. **Lift at these five commodities is not resolvable by this method.**
+Phase 5 therefore reports break-even margin and the promotional-cost
+decomposition for them, and **not** lift-dependent ROI. That is the honest
+output: the cost side is measured, the lift side is not identified, and a ratio
+of the two would inherit the failure without showing it.
+
+The `placebo` gate is unaffected in its logic — it still refuses an estimate
+inside its band — but a pass from it should not be read as a clean bill on these
+commodities, because the band it compares against is one of two mutually
+contradictory nulls.
+
+### `DEFAULT_POOL` stays `ever_treated`, on the argument and not on the evidence
+
+The pool change is **kept**, and the reason is identification rather than
+measurement: the null for a promoted cell should be measured on promoted cells,
+because that is the population the estimate is about. A never-treated pool
+answers a question nobody asked.
+
+**The evidence did not confirm the mechanism the change was justified by.** It
+was made to fix the sign disagreement and did not fix it. Recorded that way
+deliberately — a change kept for a good reason that turned out not to be the
+operative one is a different thing from a change validated by its result, and
+the file should not read as though the second happened. `POOL_KINDS` keeps
+`never_treated` runnable so the comparison stays reproducible.
+
+### Pooling cells buys 5.8× where independence predicts 22×
+
+`estimate_lift(level=...)` groups the same per-cell-week residuals into
+`campaign`, `commodity`, `commodity_store` or `cell` units. **The total is
+identical at every level** — grouping partitions residuals and cannot change
+their sum. What changes is how many cells back each reported number, and
+therefore how wide the matched band it must clear is.
+
+Measured on the five densest commodities with treatment in weeks 80–83 (FLUID
+MILK PRODUCTS 170 cells, SOFT DRINKS 946, BAKED BREAD 492, CHEESE 542, EGGS 210
+— TROPICAL FRUIT is denser than three of these but has **zero** treated cells in
+the window):
+
+| level | cells per unit | median \|gross\| | band half-width | resolvability |
+|---|--:|--:|--:|--:|
+| cell | 1 | 0.79 | 1.57 | 0.45 |
+| commodity_store | 5 | 3.00 | 5.52 | 0.54 |
+| commodity | 492 | 97.98 | 69.68 | 2.59 |
+
+Fitted across the levels:
+
+- `|gross|` ∝ cells^**0.773**
+- band half-width ∝ cells^**0.599**
+- resolvability ∝ cells^**0.296**
+
+**Independent cells would give half-width ∝ n^0.5 and resolvability ∝ n^0.5 — a
+22× gain from 1 cell to 492. The observed gain is 5.8×**, about a quarter of it.
+
+**The reason is that cells in a placebo draw share a week window.** Every cell
+in a draw is rolled out over the *same* weeks, so a week-level common shock —
+a holiday, a weather week, a chain-wide event — moves all of them together and
+never averages away. Only the idiosyncratic part of the variance falls as
+`1/n`; the common part does not fall at all. That is why the half-width
+exponent is 0.599 rather than 0.5, and it is also why `|gross|` scales at 0.773
+rather than 1.0: the pooled effect is diluted by cells that were treated for
+only part of the window (settled decision 11).
+
+**This is a finding about this data, not a failure of the method.** Pooling does
+help — resolvability rises monotonically with cells — but a reader who expects
+`sqrt(n)` will over-estimate what a commodity-level rollup buys by roughly four
+times. Anything downstream that reasons about statistical power on this panel
+should use the measured 0.296 exponent, not the textbook 0.5.
+
+### Never-treated means never, not "not this week"
+
+The pool is **14,601 of 31,896 product-stores** — those never treated anywhere
+in the panel, not merely untreated in the drawn window. A cell promoted in week
+40 is still paying it back in week 45, so a placebo window sitting on someone
+else's payback measures a real effect and calls it noise, widening the band and
+hiding genuine findings behind it. Asserted by a test.

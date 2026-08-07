@@ -58,14 +58,36 @@ from promo.gates import CampaignSpec
 from promo.io import connect
 
 __all__ = [
+    "AGGREGATION_LEVELS",
     "DEFAULT_QUANTILES",
     "LiftCampaign",
     "NoCellsError",
+    "UnknownLevelError",
+    "aggregate_residuals",
     "campaign_cells",
     "estimate_lift",
     "resolve_horizon",
     "write_diagnostics",
 ]
+
+#: How per-cell-week residuals are grouped into reported estimates.
+#:
+#: The residuals themselves are always at product-store-week — that is the only
+#: grain the baseline predicts at, and aggregating the *outcome* before
+#: estimating would need a model fitted on the aggregate series. What the level
+#: changes is how many cells are pooled into one number, and therefore what
+#: placebo band that number has to clear.
+#:
+#: **The campaign total is identical at every level.** Grouping partitions the
+#: same residuals; it does not change their sum. What changes is the
+#: signal-to-noise of each reported unit, because a placebo band is matched to
+#: the cell count of the unit it is compared against.
+AGGREGATION_LEVELS: dict[str, tuple[str, ...]] = {
+    "campaign": (),
+    "commodity": ("COMMODITY_DESC",),
+    "commodity_store": ("COMMODITY_DESC", "STORE_ID"),
+    "cell": ("PRODUCT_ID", "STORE_ID"),
+}
 
 #: The counterfactual band carried through to the lift. The baseline fits these
 #: as independent quantile models, so this is its own predictive uncertainty and
@@ -73,6 +95,10 @@ __all__ = [
 DEFAULT_QUANTILES: tuple[float, float] = (0.1, 0.9)
 
 _KEY = ("PRODUCT_ID", "STORE_ID", "WEEK_NO")
+
+
+class UnknownLevelError(Exception):
+    """The requested aggregation level is not one this module defines."""
 
 
 class NoCellsError(Exception):
@@ -408,6 +434,7 @@ def estimate_lift(
     con: duckdb.DuckDBPyConnection | None = None,
     quantiles: tuple[float, float] | None = DEFAULT_QUANTILES,
     check_drift: bool = True,
+    level: str = "campaign",
     outcome: str = "units",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Incremental units for one campaign, over a window that outlasts the cycle.
@@ -420,6 +447,10 @@ def estimate_lift(
         con: an existing DuckDB connection; one is opened and closed if omitted.
         quantiles: `(low, high)` counterfactual paths for the interval, or None
             for a point estimate only. Each is its own recursion.
+        level: how to group the residuals into reported units — a key of
+            `AGGREGATION_LEVELS`. The campaign total is the same at every
+            level; what changes is how many cells back each reported number.
+            The breakdown lands in `diagnostics["by_level"]`.
         outcome: the observed units column.
 
     Returns:
@@ -434,6 +465,10 @@ def estimate_lift(
         NoCellsError: the campaign matched no treated product-store.
         ValueError: no horizon could be resolved, so the window has no end.
     """
+    if level not in AGGREGATION_LEVELS:
+        raise UnknownLevelError(
+            f"level must be one of {sorted(AGGREGATION_LEVELS)}, got {level!r}"
+        )
     own = con is None
     con = connect() if con is None else con
     try:
@@ -483,7 +518,8 @@ def estimate_lift(
         if own:
             con.close()
 
-    residuals = window[[*_KEY, outcome, "treated"]].rename(
+    carried = [c for c in ("COMMODITY_DESC",) if c in window.columns]
+    residuals = window[[*_KEY, *carried, outcome, "treated"]].rename(
         columns={outcome: "observed_units"}
     )
     for name, frame in paths.items():
@@ -511,6 +547,10 @@ def estimate_lift(
 
     available_post = cells_diag["post_window"]["available_weeks"]
     lift = _aggregate(residuals, quantiles, available_post)
+    units, level_diag = aggregate_residuals(
+        residuals, level, available_post_weeks=available_post
+    )
+    level_diag["units"] = units.to_dict(orient="records")
     _compare_drift_to_gross(
         drift, lift["gross_incremental"], lift["net_incremental"]
     )
@@ -519,6 +559,7 @@ def estimate_lift(
         "stage": "estimate_lift",
         "campaign": campaign.model_dump(),
         "lift": lift,
+        "by_level": level_diag,
         "horizon": horizon_diag,
         "cells": cells_diag,
         "drift_check": drift,
@@ -630,6 +671,95 @@ def _aggregate(
             point["gross_incremental"], available_post_weeks
         )
     return lift
+
+
+def aggregate_residuals(
+    residuals: pd.DataFrame,
+    level: str = "campaign",
+    *,
+    available_post_weeks: int = 1,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Group per-cell-week residuals into the units a level reports.
+
+    One row per unit with its cell count, its gross, post and net, and the mean
+    units per cell that says how thin the unit is. The cell count is the number
+    the unit's placebo band has to be matched to.
+
+    Raises:
+        UnknownLevelError: `level` is not in `AGGREGATION_LEVELS`.
+        KeyError: the residuals lack a column the level groups by.
+    """
+    if level not in AGGREGATION_LEVELS:
+        raise UnknownLevelError(
+            f"level must be one of {sorted(AGGREGATION_LEVELS)}, got {level!r}"
+        )
+    keys = list(AGGREGATION_LEVELS[level])
+    missing = [k for k in keys if k not in residuals.columns]
+    if missing:
+        raise KeyError(
+            f"level {level!r} groups by {missing}, which the residuals do not "
+            f"carry. Was the panel projected before it reached estimate_lift?"
+        )
+
+    campaign_rows = residuals["phase"] == "campaign"
+    frame = residuals.assign(
+        _gross=residuals["residual"].where(campaign_rows, 0.0),
+        _post=residuals["residual"].where(~campaign_rows, 0.0),
+        _campaign_units=residuals["observed_units"].where(campaign_rows, 0.0),
+        _campaign_cf=residuals["counterfactual_units"].where(campaign_rows, 0.0),
+    )
+    grouped = frame.groupby(keys, observed=True) if keys else frame.groupby(
+        lambda _: "campaign"
+    )
+    units = grouped.agg(
+        cell_weeks=("residual", "size"),
+        gross=("_gross", "sum"),
+        post=("_post", "sum"),
+        observed_units=("_campaign_units", "sum"),
+        counterfactual_units=("_campaign_cf", "sum"),
+    )
+    cells = (
+        frame.drop_duplicates(["PRODUCT_ID", "STORE_ID"])
+        .groupby(keys, observed=True)
+        .size()
+        if keys
+        else pd.Series(
+            {"campaign": frame.drop_duplicates(["PRODUCT_ID", "STORE_ID"]).shape[0]}
+        )
+    )
+    units["cells"] = cells
+    units["net"] = units["gross"] + units["post"]
+    units["mean_units_per_cell"] = (
+        units["observed_units"] / units["cell_weeks"]
+    )
+    units["retention_ratio"] = [
+        _retention(g, n, available_post_weeks)
+        for g, n in zip(units["gross"], units["net"], strict=True)
+    ]
+    units = units.reset_index()
+    if not keys:
+        units = units.drop(columns=[c for c in ("index", "level_0") if c in units])
+
+    diagnostics = {
+        "level": level,
+        "keys": keys,
+        "n_units": len(units),
+        "cells_total": int(units["cells"].sum()),
+        "cells_per_unit": {
+            "min": int(units["cells"].min()),
+            "median": float(units["cells"].median()),
+            "max": int(units["cells"].max()),
+        },
+        "gross_total": round(float(units["gross"].sum()), 6),
+        "net_total": round(float(units["net"].sum()), 6),
+        "invariant": (
+            "The totals above are identical at every level: grouping "
+            "partitions the same residuals and cannot change their sum. What "
+            "the level changes is how many cells back each reported number, "
+            "and therefore which placebo band it has to clear."
+        ),
+    }
+    return units, diagnostics
 
 
 def _compare_drift_to_gross(

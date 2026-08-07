@@ -355,8 +355,10 @@ def passing(gate: str, message: str, detail: dict[str, Any] | None = None) -> Ga
 # --------------------------------------------------------------------------
 
 #: Gates run cheapest first, so a campaign that fails on arithmetic never pays
-#: for a model fit. `overlap` is last because it costs about two and a half
-#: minutes on the full panel and everything before it costs seconds.
+#: for a model fit. `overlap` costs about two and a half minutes on the full
+#: panel and everything before it costs seconds; `placebo` is last because it
+#: needs an estimate to already exist and a band of at least 300 rollouts to
+#: compare it against.
 GATE_ORDER: tuple[str, ...] = (
     "break_even",
     "horizon",
@@ -364,6 +366,8 @@ GATE_ORDER: tuple[str, ...] = (
     "variation",
     "collisions",
     "overlap",
+    "placebo",
+    "roi",
 )
 
 
@@ -375,6 +379,9 @@ def run_audit(
     statuses: str | Path | pd.DataFrame = "data/interim/prices.parquet",
     stop_on_refuse: bool = True,
     run_overlap: bool = True,
+    estimate: float | None = None,
+    placebo: Any = None,
+    breakeven: dict[str, Any] | None = None,
     **audit_kwargs: Any,
 ) -> tuple[list[GateResult], dict[str, Any]]:
     """Run the Phase 3 gates and return a verdict.
@@ -397,6 +404,13 @@ def run_audit(
             for diagnosis — a campaign can fail more than one and the
             short-circuit hides the rest.
         run_overlap: set False to skip the expensive model fit.
+        estimate: the measured lift, on the same scale the placebo band was
+            built on — `estimate_lift`'s `gross_incremental`. Without it the
+            placebo gate passes with a stated reason rather than being skipped.
+        placebo: the draws or band from `promo.validate.placebo_band`, matched
+            to this campaign's shape.
+        breakeven: the dict from `promo.accounting.breakeven_margin`. Without
+            it the ROI gate passes with a stated reason.
         **audit_kwargs: forwarded to the underlying `promo.audit` checks.
 
     Returns:
@@ -418,6 +432,8 @@ def run_audit(
         "variation": lambda: _gate_variation(panel, audit_module, audit_kwargs),
         "collisions": lambda: _gate_collisions(panel, audit_module, audit_kwargs),
         "overlap": lambda: _gate_overlap(panel, audit_module, audit_kwargs),
+        "placebo": lambda: _gate_placebo(estimate, placebo),
+        "roi": lambda: _gate_roi(breakeven),
     }
 
     for name in GATE_ORDER:
@@ -680,6 +696,98 @@ def _gate_overlap(panel: Any, audit_module: Any, kwargs: dict) -> GateResult:
         f"{diag['propensity_extremes']['outside_share']:.1%} of rows sit "
         f"without a counterpart.",
         diag,
+    )
+
+
+def _gate_placebo(estimate: float | None, placebo: Any) -> GateResult:
+    """Is the estimate distinguishable from a window where nothing happened?
+
+    The detection is `promo.validate.inside_band`. The two inputs are supplied
+    rather than computed here: the estimate comes from `estimate_lift` and the
+    band from `placebo_band`, both of which the caller has already run. A gate
+    that recomputed them would fit a model inside an audit.
+
+    Missing either one is a pass with a stated reason, as everywhere else in
+    this module — and the reason says the comparison was *not made*, so an
+    absent refusal cannot be read as a clean bill.
+    """
+    if estimate is None or placebo is None:
+        missing = "no estimate" if estimate is None else "no placebo band"
+        return passing(
+            "placebo",
+            f"The estimate was not compared against a placebo band: {missing} "
+            f"was supplied. It has not been shown to be distinguishable from a "
+            f"window where nothing happened.",
+            {"compared": False, "missing": missing},
+        )
+
+    from promo.validate import inside_band
+
+    overlaps, evidence = inside_band(estimate, placebo)
+    if overlaps:
+        return gate_result(
+            "placebo",
+            "PLACEBO_OVERLAP",
+            detail=evidence,
+            estimate=evidence["estimate"],
+            band_low=evidence["band_low"],
+            band_high=evidence["band_high"],
+        )
+    return passing(
+        "placebo",
+        f"The measured change of {evidence['estimate']:,.0f} units sits outside "
+        f"the {evidence['band_low']:,.0f} to {evidence['band_high']:,.0f} range "
+        f"this comparison produces on weeks when nothing happened "
+        f"({evidence['windows']} of them). That is necessary for the estimate "
+        f"to mean anything, and not sufficient — the band is drawn on rows the "
+        f"model was trained on, so it is optimistic.",
+        evidence,
+    )
+
+
+def _gate_roi(breakeven: dict[str, Any] | None) -> GateResult:
+    """Is the return bounded, and could any believable margin pay for it?
+
+    Two conditions off one calculation, because they are one statement seen
+    from opposite sides. `ROI_UNBOUNDED` when the incremental-revenue interval
+    crosses zero, so the ratio has no finite bound. `KAPPA_IMPOSSIBLE` when the
+    break-even margin exceeds 50% — no plausible grocery gross margin clears it,
+    so the campaign is arithmetically unprofitable before any measurement
+    question is asked.
+
+    The detection is `promo.accounting.breakeven_margin`, supplied rather than
+    recomputed: the numerator needs the transaction file and the denominator
+    needs the Phase 4 estimate, and an audit should not run either.
+    """
+    if breakeven is None:
+        return passing(
+            "roi",
+            "No break-even margin was supplied, so the return was not checked. "
+            "It has not been shown to be bounded.",
+            {"compared": False},
+        )
+
+    code = breakeven.get("reason_code")
+    if code == "ROI_UNBOUNDED":
+        low, high = breakeven["incremental_revenue_interval"] or (0.0, 0.0)
+        return gate_result("roi", "ROI_UNBOUNDED", detail=breakeven,
+                           low=low, high=high)
+    if code == "KAPPA_IMPOSSIBLE":
+        return gate_result(
+            "roi", "KAPPA_IMPOSSIBLE", detail=breakeven,
+            # The identity: kappa_star(m) = m_star / m, so at the top of the
+            # plausible grid m_star > 0.5 and kappa_star(0.5) > 1 say the same
+            # thing. Reported at that margin rather than inventing a code.
+            kappa=breakeven["m_star"] / 0.5,
+            depth=breakeven["m_star"], margin=0.5,
+        )
+    return passing(
+        "roi",
+        f"The promotion needed a gross margin of "
+        f"{breakeven['m_star']:.1%} to cover its own cost, which is inside the "
+        f"range a grocery business plausibly runs at. Read the sensitivity "
+        f"table at your own margin rather than this number alone.",
+        breakeven,
     )
 
 

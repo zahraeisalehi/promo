@@ -311,7 +311,11 @@ Implemented in `promo/gates.py`. Severity is part of the code, not of the caller
 
 `INSUFFICIENT_SUPPORT` and `DEPTH_BOUNDED` are deliberately separate. "We cannot see this product enough to say anything" and "this product's depth is ordinal only" are different diagnoses, and a category manager acts on each differently — see settled decision 6.
 
-`PLACEBO_OVERLAP` and `ROI_UNBOUNDED` have templates and severities here but no detection yet. `run_audit()` cannot emit them, and their absence from a verdict must not be read as a pass. They are recorded as owed by **Task 4.5** and **Task 5.2** respectively, in each task's own **Done when**, so the phase gate for each will check that the code fires through `run_audit()`.
+**`PLACEBO_OVERLAP` now fires.** Task 4.5 built its detection in `promo/validate.py` and wired it in as the `placebo` gate, last in the running order because it needs an estimate to already exist and a band of at least 300 rollouts to compare it against. It takes two supplied inputs — `run_audit(..., estimate=, placebo=)` — and with either missing it passes with a stated reason saying the comparison **was not made**, so an absent refusal cannot be read as a clean bill.
+
+**`ROI_UNBOUNDED` now fires too.** Task 5.2 built its detection in `promo.accounting.breakeven_margin` and wired it in as the `roi` gate, last in the running order because it needs both the cost total and the Phase 4 estimate. The same gate emits `KAPPA_IMPOSSIBLE` when the break-even margin exceeds 50%, by the identity `kappa_star(m) = m_star / m` — `m_star > 0.5` and `kappa_star(0.5) > 1` are one sentence, so no new code was invented for it.
+
+**All eleven reason codes can now fire through `run_audit()`.**
 
 Gates run cheapest first — `break_even`, `horizon`, `variation`, `collisions`, `overlap` — so a campaign that fails on arithmetic never pays for the model fit that costs two and a half minutes. The runner short-circuits on any `refuse` and returns the partial results computed so far. Partial output plus a stated reason is the product; a complete-looking output with a hidden failure is the thing you are arguing against. Pass `stop_on_refuse=False` to collect every verdict, since the short-circuit hides any problem after the first.
 

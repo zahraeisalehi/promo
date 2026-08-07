@@ -360,7 +360,9 @@ def test_the_pipeline_stops_at_the_first_refusal() -> None:
 
 def test_gates_run_cheapest_first() -> None:
     assert GATE_ORDER[0] == "break_even"
-    assert GATE_ORDER[-1] == "overlap"
+    # Arithmetic, then the model fit, then the placebo band — which needs both
+    # an estimate and 300 rollouts and so cannot come earlier.
+    assert GATE_ORDER[-2:] == ("overlap", "placebo")
 
 
 def test_stop_on_refuse_false_collects_every_verdict() -> None:

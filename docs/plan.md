@@ -614,6 +614,26 @@ Portfolio page as a distinct group, and feed them to Task 7.4, where a campaign
 that cannot pay at any believable margin is the cheapest stop recommendation the
 system can make — it needs no counterfactual to defend it.
 
+### Break-even is computed for every campaign, including unresolvable ones
+
+**Do not restrict the break-even margin to campaigns whose lift is resolvable.**
+It depends on observed depth and the cost actually paid — money that left the
+till — and on an assumed margin the reader supplies. **It never depends on a
+counterfactual.** Only the *interval* around it comes from the estimate;
+`breakeven_margin()` returns a point with `m_star_interval: None` when no lift
+interval is available, and it is still the right number.
+
+Restricting it to resolvable campaigns would import a limitation from a
+different calculation. That matters concretely here: Task 4.5 found that lift at
+the five densest commodities is **not resolvable**, because two independent
+nulls disagree about its sign. Those campaigns still have a known cost and an
+observed revenue, so the margin they *needed* is arithmetic.
+
+**This is the point of the measure.** It says what a promotion needed to be
+true, without needing to know what it achieved. On a dataset with no COGS column
+and an estimator that cannot separate these lifts from noise, it is the strongest
+honest statement available — and it is available everywhere.
+
 ### Task 5.3 — A supplied margin is an assumption, and is labelled as one
 
 The system accepts a margin from the user. It never forgets where it came from.
